@@ -1,313 +1,389 @@
-# Copyright 2025 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
+from __future__ import annotations
 
 import os
-from typing import Optional, Union
+import random
+import warnings
+from collections.abc import Generator, Sequence
+from typing import Any
 
-import google.auth
-import pydantic
-
-from ._api_client import BaseApiClient
-from ._base_url import get_base_url
-from ._replay_api_client import ReplayApiClient
-from .batches import AsyncBatches, Batches
-from .caches import AsyncCaches, Caches
-from .chats import AsyncChats, Chats
-from .files import AsyncFiles, Files
-from .live import AsyncLive
-from .models import AsyncModels, Models
-from .operations import AsyncOperations, Operations
-from .tokens import AsyncTokens, Tokens
-from .tunings import AsyncTunings, Tunings
-from .types import HttpOptions, HttpOptionsDict, HttpRetryOptions
-
-
-class AsyncClient:
-  """Client for making asynchronous (non-blocking) requests."""
-
-  def __init__(self, api_client: BaseApiClient):
-
-    self._api_client = api_client
-    self._models = AsyncModels(self._api_client)
-    self._tunings = AsyncTunings(self._api_client)
-    self._caches = AsyncCaches(self._api_client)
-    self._batches = AsyncBatches(self._api_client)
-    self._files = AsyncFiles(self._api_client)
-    self._live = AsyncLive(self._api_client)
-    self._tokens = AsyncTokens(self._api_client)
-    self._operations = AsyncOperations(self._api_client)
-
-  @property
-  def models(self) -> AsyncModels:
-    return self._models
-
-  @property
-  def tunings(self) -> AsyncTunings:
-    return self._tunings
-
-  @property
-  def caches(self) -> AsyncCaches:
-    return self._caches
-
-  @property
-  def batches(self) -> AsyncBatches:
-    return self._batches
-
-  @property
-  def chats(self) -> AsyncChats:
-    return AsyncChats(modules=self.models)
-
-  @property
-  def files(self) -> AsyncFiles:
-    return self._files
-
-  @property
-  def live(self) -> AsyncLive:
-    return self._live
-
-  @property
-  def auth_tokens(self) -> AsyncTokens:
-    return self._tokens
-
-  @property
-  def operations(self) -> AsyncOperations:
-    return self._operations
+from .datastructures import Headers, MultipleValuesError
+from .exceptions import (
+    InvalidHandshake,
+    InvalidHeader,
+    InvalidHeaderValue,
+    InvalidMessage,
+    InvalidStatus,
+    InvalidUpgrade,
+    NegotiationError,
+)
+from .extensions import ClientExtensionFactory, Extension
+from .headers import (
+    build_authorization_basic,
+    build_extension,
+    build_host,
+    build_subprotocol,
+    parse_connection,
+    parse_extension,
+    parse_subprotocol,
+    parse_upgrade,
+)
+from .http11 import Request, Response
+from .imports import lazy_import
+from .protocol import CLIENT, CONNECTING, OPEN, Protocol, State
+from .typing import (
+    ConnectionOption,
+    ExtensionHeader,
+    LoggerLike,
+    Origin,
+    Subprotocol,
+    UpgradeProtocol,
+)
+from .uri import WebSocketURI
+from .utils import accept_key, generate_key
 
 
-class DebugConfig(pydantic.BaseModel):
-  """Configuration options that change client network behavior when testing."""
-
-  client_mode: Optional[str] = pydantic.Field(
-      default_factory=lambda: os.getenv('GOOGLE_GENAI_CLIENT_MODE', None)
-  )
-
-  replays_directory: Optional[str] = pydantic.Field(
-      default_factory=lambda: os.getenv('GOOGLE_GENAI_REPLAYS_DIRECTORY', None)
-  )
-
-  replay_id: Optional[str] = pydantic.Field(
-      default_factory=lambda: os.getenv('GOOGLE_GENAI_REPLAY_ID', None)
-  )
+__all__ = ["ClientProtocol"]
 
 
-class Client:
-  """Client for making synchronous requests.
-
-  Use this client to make a request to the Gemini Developer API or Vertex AI
-  API and then wait for the response.
-
-  To initialize the client, provide the required arguments either directly
-  or by using environment variables. Gemini API users and Vertex AI users in
-  express mode can provide API key by providing input argument
-  `api_key="your-api-key"` or by defining `GOOGLE_API_KEY="your-api-key"` as an
-  environment variable
-
-  Vertex AI API users can provide inputs argument as `vertexai=True,
-  project="your-project-id", location="us-central1"` or by defining
-  `GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT` and
-  `GOOGLE_CLOUD_LOCATION` environment variables.
-
-  Attributes:
-    api_key: The `API key <https://ai.google.dev/gemini-api/docs/api-key>`_ to
-      use for authentication. Applies to the Gemini Developer API only.
-    vertexai: Indicates whether the client should use the Vertex AI API
-      endpoints. Defaults to False (uses Gemini Developer API endpoints).
-      Applies to the Vertex AI API only.
-    credentials: The credentials to use for authentication when calling the
-      Vertex AI APIs. Credentials can be obtained from environment variables and
-      default credentials. For more information, see `Set up Application Default
-      Credentials
-      <https://cloud.google.com/docs/authentication/provide-credentials-adc>`_.
-      Applies to the Vertex AI API only.
-    project: The `Google Cloud project ID
-      <https://cloud.google.com/vertex-ai/docs/start/cloud-environment>`_ to use
-      for quota. Can be obtained from environment variables (for example,
-      ``GOOGLE_CLOUD_PROJECT``). Applies to the Vertex AI API only.
-      Find your `Google Cloud project ID <https://cloud.google.com/resource-manager/docs/creating-managing-projects#identifying_projects>`_.
-    location: The `location
-      <https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations>`_
-      to send API requests to (for example, ``us-central1``). Can be obtained
-      from environment variables. Applies to the Vertex AI API only.
-    debug_config: Config settings that control network behavior of the client.
-      This is typically used when running test code.
-    http_options: Http options to use for the client. These options will be
-      applied to all requests made by the client. Example usage: `client =
-      genai.Client(http_options=types.HttpOptions(api_version='v1'))`.
-
-  Usage for the Gemini Developer API:
-
-  .. code-block:: python
-
-    from google import genai
-
-    client = genai.Client(api_key='my-api-key')
-
-  Usage for the Vertex AI API:
-
-  .. code-block:: python
-
-    from google import genai
-
-    client = genai.Client(
-        vertexai=True, project='my-project-id', location='us-central1'
-    )
-  """
-
-  def __init__(
-      self,
-      *,
-      vertexai: Optional[bool] = None,
-      api_key: Optional[str] = None,
-      credentials: Optional[google.auth.credentials.Credentials] = None,
-      project: Optional[str] = None,
-      location: Optional[str] = None,
-      debug_config: Optional[DebugConfig] = None,
-      http_options: Optional[Union[HttpOptions, HttpOptionsDict]] = None,
-  ):
-    """Initializes the client.
+class ClientProtocol(Protocol):
+    """
+    Sans-I/O implementation of a WebSocket client connection.
 
     Args:
-       vertexai (bool): Indicates whether the client should use the Vertex AI
-         API endpoints. Defaults to False (uses Gemini Developer API endpoints).
-         Applies to the Vertex AI API only.
-       api_key (str): The `API key
-         <https://ai.google.dev/gemini-api/docs/api-key>`_ to use for
-         authentication. Applies to the Gemini Developer API only.
-       credentials (google.auth.credentials.Credentials): The credentials to use
-         for authentication when calling the Vertex AI APIs. Credentials can be
-         obtained from environment variables and default credentials. For more
-         information, see `Set up Application Default Credentials
-         <https://cloud.google.com/docs/authentication/provide-credentials-adc>`_.
-         Applies to the Vertex AI API only.
-       project (str): The `Google Cloud project ID
-         <https://cloud.google.com/vertex-ai/docs/start/cloud-environment>`_ to
-         use for quota. Can be obtained from environment variables (for example,
-         ``GOOGLE_CLOUD_PROJECT``). Applies to the Vertex AI API only.
-       location (str): The `location
-         <https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations>`_
-         to send API requests to (for example, ``us-central1``). Can be obtained
-         from environment variables. Applies to the Vertex AI API only.
-       debug_config (DebugConfig): Config settings that control network behavior
-         of the client. This is typically used when running test code.
-       http_options (Union[HttpOptions, HttpOptionsDict]): Http options to use
-         for the client.
+        uri: URI of the WebSocket server, parsed
+            with :func:`~websockets.uri.parse_uri`.
+        origin: Value of the ``Origin`` header. This is useful when connecting
+            to a server that validates the ``Origin`` header to defend against
+            Cross-Site WebSocket Hijacking attacks.
+        extensions: List of supported extensions, in order in which they
+            should be tried.
+        subprotocols: List of supported subprotocols, in order of decreasing
+            preference.
+        state: Initial state of the WebSocket connection.
+        max_size: Maximum size of incoming messages in bytes;
+            :obj:`None` disables the limit.
+        logger: Logger for this connection;
+            defaults to ``logging.getLogger("websockets.client")``;
+            see the :doc:`logging guide <../../topics/logging>` for details.
+
     """
 
-    self._debug_config = debug_config or DebugConfig()
-    if isinstance(http_options, dict):
-      http_options = HttpOptions(**http_options)
+    def __init__(
+        self,
+        uri: WebSocketURI,
+        *,
+        origin: Origin | None = None,
+        extensions: Sequence[ClientExtensionFactory] | None = None,
+        subprotocols: Sequence[Subprotocol] | None = None,
+        state: State = CONNECTING,
+        max_size: int | None = 2**20,
+        logger: LoggerLike | None = None,
+    ) -> None:
+        super().__init__(
+            side=CLIENT,
+            state=state,
+            max_size=max_size,
+            logger=logger,
+        )
+        self.uri = uri
+        self.origin = origin
+        self.available_extensions = extensions
+        self.available_subprotocols = subprotocols
+        self.key = generate_key()
 
-    base_url = get_base_url(vertexai or False, http_options)
-    if base_url:
-      if http_options:
-        http_options.base_url = base_url
-      else:
-        http_options = HttpOptions(base_url=base_url)
+    def connect(self) -> Request:
+        """
+        Create a handshake request to open a connection.
 
-    self._api_client = self._get_api_client(
-        vertexai=vertexai,
-        api_key=api_key,
-        credentials=credentials,
-        project=project,
-        location=location,
-        debug_config=self._debug_config,
-        http_options=http_options,
-    )
+        You must send the handshake request with :meth:`send_request`.
 
-    self._aio = AsyncClient(self._api_client)
-    self._models = Models(self._api_client)
-    self._tunings = Tunings(self._api_client)
-    self._caches = Caches(self._api_client)
-    self._batches = Batches(self._api_client)
-    self._files = Files(self._api_client)
-    self._tokens = Tokens(self._api_client)
-    self._operations = Operations(self._api_client)
+        You can modify it before sending it, for example to add HTTP headers.
 
-  @staticmethod
-  def _get_api_client(
-      vertexai: Optional[bool] = None,
-      api_key: Optional[str] = None,
-      credentials: Optional[google.auth.credentials.Credentials] = None,
-      project: Optional[str] = None,
-      location: Optional[str] = None,
-      debug_config: Optional[DebugConfig] = None,
-      http_options: Optional[HttpOptions] = None,
-  ) -> BaseApiClient:
-    if debug_config and debug_config.client_mode in [
-        'record',
-        'replay',
-        'auto',
-    ]:
-      return ReplayApiClient(
-          mode=debug_config.client_mode,  # type: ignore[arg-type]
-          replay_id=debug_config.replay_id,  # type: ignore[arg-type]
-          replays_directory=debug_config.replays_directory,
-          vertexai=vertexai,  # type: ignore[arg-type]
-          api_key=api_key,
-          credentials=credentials,
-          project=project,
-          location=location,
-          http_options=http_options,
-      )
+        Returns:
+            WebSocket handshake request event to send to the server.
 
-    return BaseApiClient(
-        vertexai=vertexai,
-        api_key=api_key,
-        credentials=credentials,
-        project=project,
-        location=location,
-        http_options=http_options,
-    )
+        """
+        headers = Headers()
+        headers["Host"] = build_host(self.uri.host, self.uri.port, self.uri.secure)
+        if self.uri.user_info:
+            headers["Authorization"] = build_authorization_basic(*self.uri.user_info)
+        if self.origin is not None:
+            headers["Origin"] = self.origin
+        headers["Upgrade"] = "websocket"
+        headers["Connection"] = "Upgrade"
+        headers["Sec-WebSocket-Key"] = self.key
+        headers["Sec-WebSocket-Version"] = "13"
+        if self.available_extensions is not None:
+            headers["Sec-WebSocket-Extensions"] = build_extension(
+                [
+                    (extension_factory.name, extension_factory.get_request_params())
+                    for extension_factory in self.available_extensions
+                ]
+            )
+        if self.available_subprotocols is not None:
+            headers["Sec-WebSocket-Protocol"] = build_subprotocol(
+                self.available_subprotocols
+            )
+        return Request(self.uri.resource_name, headers)
 
-  @property
-  def chats(self) -> Chats:
-    return Chats(modules=self.models)
+    def process_response(self, response: Response) -> None:
+        """
+        Check a handshake response.
 
-  @property
-  def aio(self) -> AsyncClient:
-    return self._aio
+        Args:
+            request: WebSocket handshake response received from the server.
 
-  @property
-  def models(self) -> Models:
-    return self._models
+        Raises:
+            InvalidHandshake: If the handshake response is invalid.
 
-  @property
-  def tunings(self) -> Tunings:
-    return self._tunings
+        """
 
-  @property
-  def caches(self) -> Caches:
-    return self._caches
+        if response.status_code != 101:
+            raise InvalidStatus(response)
 
-  @property
-  def batches(self) -> Batches:
-    return self._batches
+        headers = response.headers
 
-  @property
-  def files(self) -> Files:
-    return self._files
+        connection: list[ConnectionOption] = sum(
+            [parse_connection(value) for value in headers.get_all("Connection")], []
+        )
+        if not any(value.lower() == "upgrade" for value in connection):
+            raise InvalidUpgrade(
+                "Connection", ", ".join(connection) if connection else None
+            )
 
-  @property
-  def auth_tokens(self) -> Tokens:
-    return self._tokens
+        upgrade: list[UpgradeProtocol] = sum(
+            [parse_upgrade(value) for value in headers.get_all("Upgrade")], []
+        )
+        # For compatibility with non-strict implementations, ignore case when
+        # checking the Upgrade header. It's supposed to be 'WebSocket'.
+        if not (len(upgrade) == 1 and upgrade[0].lower() == "websocket"):
+            raise InvalidUpgrade("Upgrade", ", ".join(upgrade) if upgrade else None)
 
-  @property
-  def operations(self) -> Operations:
-    return self._operations
+        try:
+            s_w_accept = headers["Sec-WebSocket-Accept"]
+        except KeyError:
+            raise InvalidHeader("Sec-WebSocket-Accept") from None
+        except MultipleValuesError:
+            raise InvalidHeader("Sec-WebSocket-Accept", "multiple values") from None
+        if s_w_accept != accept_key(self.key):
+            raise InvalidHeaderValue("Sec-WebSocket-Accept", s_w_accept)
 
-  @property
-  def vertexai(self) -> bool:
-    """Returns whether the client is using the Vertex AI API."""
-    return self._api_client.vertexai or False
+        self.extensions = self.process_extensions(headers)
+        self.subprotocol = self.process_subprotocol(headers)
+
+    def process_extensions(self, headers: Headers) -> list[Extension]:
+        """
+        Handle the Sec-WebSocket-Extensions HTTP response header.
+
+        Check that each extension is supported, as well as its parameters.
+
+        :rfc:`6455` leaves the rules up to the specification of each
+        extension.
+
+        To provide this level of flexibility, for each extension accepted by
+        the server, we check for a match with each extension available in the
+        client configuration. If no match is found, an exception is raised.
+
+        If several variants of the same extension are accepted by the server,
+        it may be configured several times, which won't make sense in general.
+        Extensions must implement their own requirements. For this purpose,
+        the list of previously accepted extensions is provided.
+
+        Other requirements, for example related to mandatory extensions or the
+        order of extensions, may be implemented by overriding this method.
+
+        Args:
+            headers: WebSocket handshake response headers.
+
+        Returns:
+            List of accepted extensions.
+
+        Raises:
+            InvalidHandshake: To abort the handshake.
+
+        """
+        accepted_extensions: list[Extension] = []
+
+        extensions = headers.get_all("Sec-WebSocket-Extensions")
+
+        if extensions:
+            if self.available_extensions is None:
+                raise NegotiationError("no extensions supported")
+
+            parsed_extensions: list[ExtensionHeader] = sum(
+                [parse_extension(header_value) for header_value in extensions], []
+            )
+
+            for name, response_params in parsed_extensions:
+                for extension_factory in self.available_extensions:
+                    # Skip non-matching extensions based on their name.
+                    if extension_factory.name != name:
+                        continue
+
+                    # Skip non-matching extensions based on their params.
+                    try:
+                        extension = extension_factory.process_response_params(
+                            response_params, accepted_extensions
+                        )
+                    except NegotiationError:
+                        continue
+
+                    # Add matching extension to the final list.
+                    accepted_extensions.append(extension)
+
+                    # Break out of the loop once we have a match.
+                    break
+
+                # If we didn't break from the loop, no extension in our list
+                # matched what the server sent. Fail the connection.
+                else:
+                    raise NegotiationError(
+                        f"Unsupported extension: "
+                        f"name = {name}, params = {response_params}"
+                    )
+
+        return accepted_extensions
+
+    def process_subprotocol(self, headers: Headers) -> Subprotocol | None:
+        """
+        Handle the Sec-WebSocket-Protocol HTTP response header.
+
+        If provided, check that it contains exactly one supported subprotocol.
+
+        Args:
+            headers: WebSocket handshake response headers.
+
+        Returns:
+           Subprotocol, if one was selected.
+
+        """
+        subprotocol: Subprotocol | None = None
+
+        subprotocols = headers.get_all("Sec-WebSocket-Protocol")
+
+        if subprotocols:
+            if self.available_subprotocols is None:
+                raise NegotiationError("no subprotocols supported")
+
+            parsed_subprotocols: Sequence[Subprotocol] = sum(
+                [parse_subprotocol(header_value) for header_value in subprotocols], []
+            )
+            if len(parsed_subprotocols) > 1:
+                raise InvalidHeader(
+                    "Sec-WebSocket-Protocol",
+                    f"multiple values: {', '.join(parsed_subprotocols)}",
+                )
+
+            subprotocol = parsed_subprotocols[0]
+            if subprotocol not in self.available_subprotocols:
+                raise NegotiationError(f"unsupported subprotocol: {subprotocol}")
+
+        return subprotocol
+
+    def send_request(self, request: Request) -> None:
+        """
+        Send a handshake request to the server.
+
+        Args:
+            request: WebSocket handshake request event.
+
+        """
+        if self.debug:
+            self.logger.debug("> GET %s HTTP/1.1", request.path)
+            for key, value in request.headers.raw_items():
+                self.logger.debug("> %s: %s", key, value)
+
+        self.writes.append(request.serialize())
+
+    def parse(self) -> Generator[None]:
+        if self.state is CONNECTING:
+            try:
+                response = yield from Response.parse(
+                    self.reader.read_line,
+                    self.reader.read_exact,
+                    self.reader.read_to_eof,
+                )
+            except Exception as exc:
+                self.handshake_exc = InvalidMessage(
+                    "did not receive a valid HTTP response"
+                )
+                self.handshake_exc.__cause__ = exc
+                self.send_eof()
+                self.parser = self.discard()
+                next(self.parser)  # start coroutine
+                yield
+
+            if self.debug:
+                code, phrase = response.status_code, response.reason_phrase
+                self.logger.debug("< HTTP/1.1 %d %s", code, phrase)
+                for key, value in response.headers.raw_items():
+                    self.logger.debug("< %s: %s", key, value)
+                if response.body:
+                    self.logger.debug("< [body] (%d bytes)", len(response.body))
+
+            try:
+                self.process_response(response)
+            except InvalidHandshake as exc:
+                response._exception = exc
+                self.events.append(response)
+                self.handshake_exc = exc
+                self.send_eof()
+                self.parser = self.discard()
+                next(self.parser)  # start coroutine
+                yield
+
+            assert self.state is CONNECTING
+            self.state = OPEN
+            self.events.append(response)
+
+        yield from super().parse()
+
+
+class ClientConnection(ClientProtocol):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        warnings.warn(  # deprecated in 11.0 - 2023-04-02
+            "ClientConnection was renamed to ClientProtocol",
+            DeprecationWarning,
+        )
+        super().__init__(*args, **kwargs)
+
+
+BACKOFF_INITIAL_DELAY = float(os.environ.get("WEBSOCKETS_BACKOFF_INITIAL_DELAY", "5"))
+BACKOFF_MIN_DELAY = float(os.environ.get("WEBSOCKETS_BACKOFF_MIN_DELAY", "3.1"))
+BACKOFF_MAX_DELAY = float(os.environ.get("WEBSOCKETS_BACKOFF_MAX_DELAY", "90.0"))
+BACKOFF_FACTOR = float(os.environ.get("WEBSOCKETS_BACKOFF_FACTOR", "1.618"))
+
+
+def backoff(
+    initial_delay: float = BACKOFF_INITIAL_DELAY,
+    min_delay: float = BACKOFF_MIN_DELAY,
+    max_delay: float = BACKOFF_MAX_DELAY,
+    factor: float = BACKOFF_FACTOR,
+) -> Generator[float]:
+    """
+    Generate a series of backoff delays between reconnection attempts.
+
+    Yields:
+        How many seconds to wait before retrying to connect.
+
+    """
+    # Add a random initial delay between 0 and 5 seconds.
+    # See 7.2.3. Recovering from Abnormal Closure in RFC 6455.
+    yield random.random() * initial_delay
+    delay = min_delay
+    while delay < max_delay:
+        yield delay
+        delay *= factor
+    while True:
+        yield max_delay
+
+
+lazy_import(
+    globals(),
+    deprecated_aliases={
+        # deprecated in 14.0 - 2024-11-09
+        "WebSocketClientProtocol": ".legacy.client",
+        "connect": ".legacy.client",
+        "unix_connect": ".legacy.client",
+    },
+)
