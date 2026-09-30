@@ -1,13 +1,62 @@
-# This file is dual licensed under the terms of the Apache License, Version
-# 2.0, and the BSD License. See the LICENSE file in the root of this repository
-# for complete details.
-
-from __future__ import annotations
-
+# -*- coding: utf-8 -*-
 """
-Hazardous Materials
-
-This is a "Hazardous Materials" module. You should ONLY use it if you're
-100% absolutely sure that you know what you're doing because this module
-is full of land mines, dragons, and dinosaurs with laser guns.
+The root of the greenlet package.
 """
+
+__all__ = [
+    '__version__',
+    '_C_API',
+
+    'GreenletExit',
+    'error',
+
+    'getcurrent',
+    'greenlet',
+
+    'gettrace',
+    'settrace',
+]
+
+# pylint:disable=no-name-in-module
+
+###
+# Metadata
+###
+__version__ = '3.5.6'
+from ._greenlet import _C_API # pylint:disable=no-name-in-module
+
+###
+# Exceptions
+###
+from ._greenlet import GreenletExit
+from ._greenlet import error
+
+###
+# greenlets
+###
+from ._greenlet import getcurrent
+from ._greenlet import greenlet
+
+###
+# tracing
+###
+from ._greenlet import gettrace
+from ._greenlet import settrace
+
+###
+# Constants
+# These constants aren't documented and aren't recommended.
+# In 1.0, USE_GC and USE_TRACING are always true, and USE_CONTEXT_VARS
+# is the same as ``sys.version_info[:2] >= 3.7``
+###
+from ._greenlet import GREENLET_USE_CONTEXT_VARS # pylint:disable=unused-import
+from ._greenlet import GREENLET_USE_GC # pylint:disable=unused-import
+from ._greenlet import GREENLET_USE_TRACING # pylint:disable=unused-import
+
+# Controlling the use of the gc module. Provisional API for this greenlet
+# implementation in 2.0.
+from ._greenlet import CLOCKS_PER_SEC # pylint:disable=unused-import
+from ._greenlet import enable_optional_cleanup # pylint:disable=unused-import
+from ._greenlet import get_clocks_used_doing_optional_cleanup # pylint:disable=unused-import
+
+# Other APIS in the _greenlet module are for test support.
