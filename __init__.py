@@ -1,33 +1,236 @@
-# This is a stub package designed to roughly emulate the _yaml
-# extension module, which previously existed as a standalone module
-# and has been moved into the `yaml` package namespace.
-# It does not perfectly mimic its old counterpart, but should get
-# close enough for anyone who's relying on it even when they shouldn't.
-import yaml
+from __future__ import annotations
 
-# in some circumstances, the yaml module we imoprted may be from a different version, so we need
-# to tread carefully when poking at it here (it may not have the attributes we expect)
-if not getattr(yaml, '__with_libyaml__', False):
-    from sys import version_info
+# Importing the typing module would conflict with websockets.typing.
+from typing import TYPE_CHECKING
 
-    exc = ModuleNotFoundError if version_info >= (3, 6) else ImportError
-    raise exc("No module named '_yaml'")
-else:
-    from yaml._yaml import *
-    import warnings
-    warnings.warn(
-        'The _yaml extension module is now located at yaml._yaml'
-        ' and its location is subject to change.  To use the'
-        ' LibYAML-based parser and emitter, import from `yaml`:'
-        ' `from yaml import CLoader as Loader, CDumper as Dumper`.',
-        DeprecationWarning
+from .imports import lazy_import
+from .version import version as __version__  # noqa: F401
+
+
+__all__ = [
+    # .asyncio.client
+    "connect",
+    "unix_connect",
+    "ClientConnection",
+    # .asyncio.router
+    "route",
+    "unix_route",
+    "Router",
+    # .asyncio.server
+    "basic_auth",
+    "broadcast",
+    "serve",
+    "unix_serve",
+    "ServerConnection",
+    "Server",
+    # .client
+    "ClientProtocol",
+    # .datastructures
+    "Headers",
+    "HeadersLike",
+    "MultipleValuesError",
+    # .exceptions
+    "ConcurrencyError",
+    "ConnectionClosed",
+    "ConnectionClosedError",
+    "ConnectionClosedOK",
+    "DuplicateParameter",
+    "InvalidHandshake",
+    "InvalidHeader",
+    "InvalidHeaderFormat",
+    "InvalidHeaderValue",
+    "InvalidMessage",
+    "InvalidOrigin",
+    "InvalidParameterName",
+    "InvalidParameterValue",
+    "InvalidProxy",
+    "InvalidProxyMessage",
+    "InvalidProxyStatus",
+    "InvalidState",
+    "InvalidStatus",
+    "InvalidUpgrade",
+    "InvalidURI",
+    "NegotiationError",
+    "PayloadTooBig",
+    "ProtocolError",
+    "ProxyError",
+    "SecurityError",
+    "WebSocketException",
+    # .frames
+    "Close",
+    "CloseCode",
+    "Frame",
+    "Opcode",
+    # .http11
+    "Request",
+    "Response",
+    # .protocol
+    "Protocol",
+    "Side",
+    "State",
+    # .server
+    "ServerProtocol",
+    # .typing
+    "Data",
+    "ExtensionName",
+    "ExtensionParameter",
+    "LoggerLike",
+    "StatusLike",
+    "Origin",
+    "Subprotocol",
+]
+
+# When type checking, import non-deprecated aliases eagerly. Else, import on demand.
+if TYPE_CHECKING:
+    from .asyncio.client import ClientConnection, connect, unix_connect
+    from .asyncio.router import Router, route, unix_route
+    from .asyncio.server import (
+        Server,
+        ServerConnection,
+        basic_auth,
+        broadcast,
+        serve,
+        unix_serve,
     )
-    del warnings
-    # Don't `del yaml` here because yaml is actually an existing
-    # namespace member of _yaml.
-
-__name__ = '_yaml'
-# If the module is top-level (i.e. not a part of any specific package)
-# then the attribute should be set to ''.
-# https://docs.python.org/3.8/library/types.html
-__package__ = ''
+    from .client import ClientProtocol
+    from .datastructures import Headers, HeadersLike, MultipleValuesError
+    from .exceptions import (
+        ConcurrencyError,
+        ConnectionClosed,
+        ConnectionClosedError,
+        ConnectionClosedOK,
+        DuplicateParameter,
+        InvalidHandshake,
+        InvalidHeader,
+        InvalidHeaderFormat,
+        InvalidHeaderValue,
+        InvalidMessage,
+        InvalidOrigin,
+        InvalidParameterName,
+        InvalidParameterValue,
+        InvalidProxy,
+        InvalidProxyMessage,
+        InvalidProxyStatus,
+        InvalidState,
+        InvalidStatus,
+        InvalidUpgrade,
+        InvalidURI,
+        NegotiationError,
+        PayloadTooBig,
+        ProtocolError,
+        ProxyError,
+        SecurityError,
+        WebSocketException,
+    )
+    from .frames import Close, CloseCode, Frame, Opcode
+    from .http11 import Request, Response
+    from .protocol import Protocol, Side, State
+    from .server import ServerProtocol
+    from .typing import (
+        Data,
+        ExtensionName,
+        ExtensionParameter,
+        LoggerLike,
+        Origin,
+        StatusLike,
+        Subprotocol,
+    )
+else:
+    lazy_import(
+        globals(),
+        aliases={
+            # .asyncio.client
+            "connect": ".asyncio.client",
+            "unix_connect": ".asyncio.client",
+            "ClientConnection": ".asyncio.client",
+            # .asyncio.router
+            "route": ".asyncio.router",
+            "unix_route": ".asyncio.router",
+            "Router": ".asyncio.router",
+            # .asyncio.server
+            "basic_auth": ".asyncio.server",
+            "broadcast": ".asyncio.server",
+            "serve": ".asyncio.server",
+            "unix_serve": ".asyncio.server",
+            "ServerConnection": ".asyncio.server",
+            "Server": ".asyncio.server",
+            # .client
+            "ClientProtocol": ".client",
+            # .datastructures
+            "Headers": ".datastructures",
+            "HeadersLike": ".datastructures",
+            "MultipleValuesError": ".datastructures",
+            # .exceptions
+            "ConcurrencyError": ".exceptions",
+            "ConnectionClosed": ".exceptions",
+            "ConnectionClosedError": ".exceptions",
+            "ConnectionClosedOK": ".exceptions",
+            "DuplicateParameter": ".exceptions",
+            "InvalidHandshake": ".exceptions",
+            "InvalidHeader": ".exceptions",
+            "InvalidHeaderFormat": ".exceptions",
+            "InvalidHeaderValue": ".exceptions",
+            "InvalidMessage": ".exceptions",
+            "InvalidOrigin": ".exceptions",
+            "InvalidParameterName": ".exceptions",
+            "InvalidParameterValue": ".exceptions",
+            "InvalidProxy": ".exceptions",
+            "InvalidProxyMessage": ".exceptions",
+            "InvalidProxyStatus": ".exceptions",
+            "InvalidState": ".exceptions",
+            "InvalidStatus": ".exceptions",
+            "InvalidUpgrade": ".exceptions",
+            "InvalidURI": ".exceptions",
+            "NegotiationError": ".exceptions",
+            "PayloadTooBig": ".exceptions",
+            "ProtocolError": ".exceptions",
+            "ProxyError": ".exceptions",
+            "SecurityError": ".exceptions",
+            "WebSocketException": ".exceptions",
+            # .frames
+            "Close": ".frames",
+            "CloseCode": ".frames",
+            "Frame": ".frames",
+            "Opcode": ".frames",
+            # .http11
+            "Request": ".http11",
+            "Response": ".http11",
+            # .protocol
+            "Protocol": ".protocol",
+            "Side": ".protocol",
+            "State": ".protocol",
+            # .server
+            "ServerProtocol": ".server",
+            # .typing
+            "Data": ".typing",
+            "ExtensionName": ".typing",
+            "ExtensionParameter": ".typing",
+            "LoggerLike": ".typing",
+            "Origin": ".typing",
+            "StatusLike": ".typing",
+            "Subprotocol": ".typing",
+        },
+        deprecated_aliases={
+            # deprecated in 9.0 - 2021-09-01
+            "framing": ".legacy",
+            "handshake": ".legacy",
+            "parse_uri": ".uri",
+            "WebSocketURI": ".uri",
+            # deprecated in 14.0 - 2024-11-09
+            # .legacy.auth
+            "BasicAuthWebSocketServerProtocol": ".legacy.auth",
+            "basic_auth_protocol_factory": ".legacy.auth",
+            # .legacy.client
+            "WebSocketClientProtocol": ".legacy.client",
+            # .legacy.exceptions
+            "AbortHandshake": ".legacy.exceptions",
+            "InvalidStatusCode": ".legacy.exceptions",
+            "RedirectHandshake": ".legacy.exceptions",
+            "WebSocketProtocolError": ".legacy.exceptions",
+            # .legacy.protocol
+            "WebSocketCommonProtocol": ".legacy.protocol",
+            # .legacy.server
+            "WebSocketServer": ".legacy.server",
+            "WebSocketServerProtocol": ".legacy.server",
+        },
+    )
