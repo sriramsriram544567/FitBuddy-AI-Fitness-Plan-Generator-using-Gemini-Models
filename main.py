@@ -1,1076 +1,1773 @@
-"""Core implementation of the testing process: init, session, runtest loop."""
+"""Logic for creating models."""
 
-from __future__ import annotations
+# Because `dict` is in the local namespace of the `BaseModel` class, we use `Dict` for annotations.
+# TODO v3 fallback to `dict` when the deprecated `dict` method gets removed.
+# ruff: noqa: UP035
 
-import argparse
-from collections.abc import Callable
-from collections.abc import Iterable
-from collections.abc import Iterator
-from collections.abc import Sequence
-from collections.abc import Set as AbstractSet
-import dataclasses
-import fnmatch
-import functools
-import importlib
-import importlib.util
-import os
-from pathlib import Path
+from __future__ import annotations as _annotations
+
+import operator
 import sys
-from typing import final
-from typing import Literal
-from typing import overload
-from typing import TYPE_CHECKING
+import types
+import typing
 import warnings
+from collections.abc import Generator, Mapping
+from copy import copy, deepcopy
+from functools import cached_property
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Literal,
+    TypeVar,
+    Union,
+    cast,
+    overload,
+)
 
-import pluggy
+import pydantic_core
+import typing_extensions
+from pydantic_core import PydanticUndefined, ValidationError
+from typing_extensions import Self, TypeAlias, Unpack
 
-from _pytest import nodes
-import _pytest._code
-from _pytest.config import Config
-from _pytest.config import directory_arg
-from _pytest.config import ExitCode
-from _pytest.config import hookimpl
-from _pytest.config import PytestPluginManager
-from _pytest.config import UsageError
-from _pytest.config.argparsing import Parser
-from _pytest.config.compat import PathAwareHookProxy
-from _pytest.outcomes import exit
-from _pytest.pathlib import absolutepath
-from _pytest.pathlib import bestrelpath
-from _pytest.pathlib import fnmatch_ex
-from _pytest.pathlib import safe_exists
-from _pytest.pathlib import scandir
-from _pytest.reports import CollectReport
-from _pytest.reports import TestReport
-from _pytest.runner import collect_one_node
-from _pytest.runner import SetupState
-from _pytest.warning_types import PytestWarning
-
+from . import PydanticDeprecatedSince20, PydanticDeprecatedSince211
+from ._internal import (
+    _config,
+    _decorators,
+    _fields,
+    _forward_ref,
+    _generics,
+    _mock_val_ser,
+    _model_construction,
+    _namespace_utils,
+    _repr,
+    _typing_extra,
+    _utils,
+)
+from ._migration import getattr_migration
+from .aliases import AliasChoices, AliasPath
+from .annotated_handlers import GetCoreSchemaHandler, GetJsonSchemaHandler
+from .config import ConfigDict
+from .errors import PydanticUndefinedAnnotation, PydanticUserError
+from .json_schema import DEFAULT_REF_TEMPLATE, GenerateJsonSchema, JsonSchemaMode, JsonSchemaValue, model_json_schema
+from .plugin._schema_validator import PluggableSchemaValidator
 
 if TYPE_CHECKING:
-    from typing_extensions import Self
+    from inspect import Signature
+    from pathlib import Path
 
-    from _pytest.fixtures import FixtureManager
+    from pydantic_core import CoreSchema, SchemaSerializer, SchemaValidator
 
+    from ._internal._namespace_utils import MappingNamespace
+    from ._internal._utils import AbstractSetIntStr, MappingIntStrAny
+    from .deprecated.parse import Protocol as DeprecatedParseProtocol
+    from .fields import ComputedFieldInfo, FieldInfo, ModelPrivateAttr
+else:
+    # See PyCharm issues https://youtrack.jetbrains.com/issue/PY-21915
+    # and https://youtrack.jetbrains.com/issue/PY-51428
+    DeprecationWarning = PydanticDeprecatedSince20
 
-def pytest_addoption(parser: Parser) -> None:
-    group = parser.getgroup("general", "Running and selection options")
-    group._addoption(  # private to use reserved lower-case short option
-        "-x",
-        "--exitfirst",
-        action="store_const",
-        dest="maxfail",
-        const=1,
-        help="Exit instantly on first error or failed test",
-    )
-    group.addoption(
-        "--maxfail",
-        metavar="num",
-        action="store",
-        type=int,
-        dest="maxfail",
-        default=0,
-        help="Exit after first num failures or errors",
-    )
-    group.addoption(
-        "--strict-config",
-        action="store_true",
-        help="Any warnings encountered while parsing the `pytest` section of the "
-        "configuration file raise errors",
-    )
-    group.addoption(
-        "--strict-markers",
-        action="store_true",
-        help="Markers not registered in the `markers` section of the configuration "
-        "file raise errors",
-    )
-    group.addoption(
-        "--strict",
-        action="store_true",
-        help="(Deprecated) alias to --strict-markers",
-    )
+__all__ = 'BaseModel', 'create_model'
 
-    group = parser.getgroup("pytest-warnings")
-    group.addoption(
-        "-W",
-        "--pythonwarnings",
-        action="append",
-        help="Set which warnings to report, see -W option of Python itself",
-    )
-    parser.addini(
-        "filterwarnings",
-        type="linelist",
-        help="Each line specifies a pattern for "
-        "warnings.filterwarnings. "
-        "Processed after -W/--pythonwarnings.",
-    )
+# Keep these type aliases available at runtime:
+TupleGenerator: TypeAlias = Generator[tuple[str, Any], None, None]
+# NOTE: In reality, `bool` should be replaced by `Literal[True]` but mypy fails to correctly apply bidirectional
+# type inference (e.g. when using `{'a': {'b': True}}`):
+# NOTE: Keep this type alias in sync with the stub definition in `pydantic-core`:
+IncEx: TypeAlias = Union[set[int], set[str], Mapping[int, Union['IncEx', bool]], Mapping[str, Union['IncEx', bool]]]
 
-    group = parser.getgroup("collect", "collection")
-    group.addoption(
-        "--collectonly",
-        "--collect-only",
-        "--co",
-        action="store_true",
-        help="Only collect tests, don't execute them",
-    )
-    group.addoption(
-        "--pyargs",
-        action="store_true",
-        help="Try to interpret all arguments as Python packages",
-    )
-    group.addoption(
-        "--ignore",
-        action="append",
-        metavar="path",
-        help="Ignore path during collection (multi-allowed)",
-    )
-    group.addoption(
-        "--ignore-glob",
-        action="append",
-        metavar="path",
-        help="Ignore path pattern during collection (multi-allowed)",
-    )
-    group.addoption(
-        "--deselect",
-        action="append",
-        metavar="nodeid_prefix",
-        help="Deselect item (via node id prefix) during collection (multi-allowed)",
-    )
-    group.addoption(
-        "--confcutdir",
-        dest="confcutdir",
-        default=None,
-        metavar="dir",
-        type=functools.partial(directory_arg, optname="--confcutdir"),
-        help="Only load conftest.py's relative to specified dir",
-    )
-    group.addoption(
-        "--noconftest",
-        action="store_true",
-        dest="noconftest",
-        default=False,
-        help="Don't load any conftest.py files",
-    )
-    group.addoption(
-        "--keepduplicates",
-        "--keep-duplicates",
-        action="store_true",
-        dest="keepduplicates",
-        default=False,
-        help="Keep duplicate tests",
-    )
-    group.addoption(
-        "--collect-in-virtualenv",
-        action="store_true",
-        dest="collect_in_virtualenv",
-        default=False,
-        help="Don't ignore tests in a local virtualenv directory",
-    )
-    group.addoption(
-        "--continue-on-collection-errors",
-        action="store_true",
-        default=False,
-        dest="continue_on_collection_errors",
-        help="Force test execution even if collection errors occur",
-    )
-    group.addoption(
-        "--import-mode",
-        default="prepend",
-        choices=["prepend", "append", "importlib"],
-        dest="importmode",
-        help="Prepend/append to sys.path when importing test modules and conftest "
-        "files. Default: prepend.",
-    )
-    parser.addini(
-        "norecursedirs",
-        "Directory patterns to avoid for recursion",
-        type="args",
-        default=[
-            "*.egg",
-            ".*",
-            "_darcs",
-            "build",
-            "CVS",
-            "dist",
-            "node_modules",
-            "venv",
-            "{arch}",
-        ],
-    )
-    parser.addini(
-        "testpaths",
-        "Directories to search for tests when no files or directories are given on the "
-        "command line",
-        type="args",
-        default=[],
-    )
-    parser.addini(
-        "collect_imported_tests",
-        "Whether to collect tests in imported modules outside `testpaths`",
-        type="bool",
-        default=True,
-    )
-    parser.addini(
-        "consider_namespace_packages",
-        type="bool",
-        default=False,
-        help="Consider namespace packages when resolving module names during import",
-    )
-
-    group = parser.getgroup("debugconfig", "test session debugging and configuration")
-    group._addoption(  # private to use reserved lower-case short option
-        "-c",
-        "--config-file",
-        metavar="FILE",
-        type=str,
-        dest="inifilename",
-        help="Load configuration from `FILE` instead of trying to locate one of the "
-        "implicit configuration files.",
-    )
-    group.addoption(
-        "--rootdir",
-        action="store",
-        dest="rootdir",
-        help="Define root directory for tests. Can be relative path: 'root_dir', './root_dir', "
-        "'root_dir/another_dir/'; absolute path: '/home/user/root_dir'; path with variables: "
-        "'$HOME/root_dir'.",
-    )
-    group.addoption(
-        "--basetemp",
-        dest="basetemp",
-        default=None,
-        type=validate_basetemp,
-        metavar="dir",
-        help=(
-            "Base temporary directory for this test run. "
-            "(Warning: this directory is removed if it exists.)"
-        ),
-    )
+_object_setattr = _model_construction.object_setattr
 
 
-def validate_basetemp(path: str) -> str:
-    # GH 7119
-    msg = "basetemp must not be empty, the current working directory or any parent directory of it"
-
-    # empty path
-    if not path:
-        raise argparse.ArgumentTypeError(msg)
-
-    def is_ancestor(base: Path, query: Path) -> bool:
-        """Return whether query is an ancestor of base."""
-        if base == query:
-            return True
-        return query in base.parents
-
-    # check if path is an ancestor of cwd
-    if is_ancestor(Path.cwd(), Path(path).absolute()):
-        raise argparse.ArgumentTypeError(msg)
-
-    # check symlinks for ancestors
-    if is_ancestor(Path.cwd().resolve(), Path(path).resolve()):
-        raise argparse.ArgumentTypeError(msg)
-
-    return path
-
-
-def wrap_session(
-    config: Config, doit: Callable[[Config, Session], int | ExitCode | None]
-) -> int | ExitCode:
-    """Skeleton command line program."""
-    session = Session.from_config(config)
-    session.exitstatus = ExitCode.OK
-    initstate = 0
-    try:
-        try:
-            config._do_configure()
-            initstate = 1
-            config.hook.pytest_sessionstart(session=session)
-            initstate = 2
-            session.exitstatus = doit(config, session) or 0
-        except UsageError:
-            session.exitstatus = ExitCode.USAGE_ERROR
-            raise
-        except Failed:
-            session.exitstatus = ExitCode.TESTS_FAILED
-        except (KeyboardInterrupt, exit.Exception):
-            excinfo = _pytest._code.ExceptionInfo.from_current()
-            exitstatus: int | ExitCode = ExitCode.INTERRUPTED
-            if isinstance(excinfo.value, exit.Exception):
-                if excinfo.value.returncode is not None:
-                    exitstatus = excinfo.value.returncode
-                if initstate < 2:
-                    sys.stderr.write(f"{excinfo.typename}: {excinfo.value.msg}\n")
-            config.hook.pytest_keyboard_interrupt(excinfo=excinfo)
-            session.exitstatus = exitstatus
-        except BaseException:
-            session.exitstatus = ExitCode.INTERNAL_ERROR
-            excinfo = _pytest._code.ExceptionInfo.from_current()
-            try:
-                config.notify_exception(excinfo, config.option)
-            except exit.Exception as exc:
-                if exc.returncode is not None:
-                    session.exitstatus = exc.returncode
-                sys.stderr.write(f"{type(exc).__name__}: {exc}\n")
-            else:
-                if isinstance(excinfo.value, SystemExit):
-                    sys.stderr.write("mainloop: caught unexpected SystemExit!\n")
-
-    finally:
-        # Explicitly break reference cycle.
-        excinfo = None  # type: ignore
-        os.chdir(session.startpath)
-        if initstate >= 2:
-            try:
-                config.hook.pytest_sessionfinish(
-                    session=session, exitstatus=session.exitstatus
-                )
-            except exit.Exception as exc:
-                if exc.returncode is not None:
-                    session.exitstatus = exc.returncode
-                sys.stderr.write(f"{type(exc).__name__}: {exc}\n")
-        config._ensure_unconfigure()
-    return session.exitstatus
-
-
-def pytest_cmdline_main(config: Config) -> int | ExitCode:
-    return wrap_session(config, _main)
-
-
-def _main(config: Config, session: Session) -> int | ExitCode | None:
-    """Default command line protocol for initialization, session,
-    running tests and reporting."""
-    config.hook.pytest_collection(session=session)
-    config.hook.pytest_runtestloop(session=session)
-
-    if session.testsfailed:
-        return ExitCode.TESTS_FAILED
-    elif session.testscollected == 0:
-        return ExitCode.NO_TESTS_COLLECTED
-    return None
-
-
-def pytest_collection(session: Session) -> None:
-    session.perform_collect()
-
-
-def pytest_runtestloop(session: Session) -> bool:
-    if session.testsfailed and not session.config.option.continue_on_collection_errors:
-        raise session.Interrupted(
-            f"{session.testsfailed} error{'s' if session.testsfailed != 1 else ''} during collection"
-        )
-
-    if session.config.option.collectonly:
-        return True
-
-    for i, item in enumerate(session.items):
-        nextitem = session.items[i + 1] if i + 1 < len(session.items) else None
-        item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
-        if session.shouldfail:
-            raise session.Failed(session.shouldfail)
-        if session.shouldstop:
-            raise session.Interrupted(session.shouldstop)
-    return True
-
-
-def _in_venv(path: Path) -> bool:
-    """Attempt to detect if ``path`` is the root of a Virtual Environment by
-    checking for the existence of the pyvenv.cfg file.
-
-    [https://peps.python.org/pep-0405/]
-
-    For regression protection we also check for conda environments that do not include pyenv.cfg yet --
-    https://github.com/conda/conda/issues/13337 is the conda issue tracking adding pyenv.cfg.
-
-    Checking for the `conda-meta/history` file per https://github.com/pytest-dev/pytest/issues/12652#issuecomment-2246336902.
-
-    """
-    try:
-        return (
-            path.joinpath("pyvenv.cfg").is_file()
-            or path.joinpath("conda-meta", "history").is_file()
-        )
-    except OSError:
-        return False
-
-
-def pytest_ignore_collect(collection_path: Path, config: Config) -> bool | None:
-    if collection_path.name == "__pycache__":
-        return True
-
-    ignore_paths = config._getconftest_pathlist(
-        "collect_ignore", path=collection_path.parent
-    )
-    ignore_paths = ignore_paths or []
-    excludeopt = config.getoption("ignore")
-    if excludeopt:
-        ignore_paths.extend(absolutepath(x) for x in excludeopt)
-
-    if collection_path in ignore_paths:
-        return True
-
-    ignore_globs = config._getconftest_pathlist(
-        "collect_ignore_glob", path=collection_path.parent
-    )
-    ignore_globs = ignore_globs or []
-    excludeglobopt = config.getoption("ignore_glob")
-    if excludeglobopt:
-        ignore_globs.extend(absolutepath(x) for x in excludeglobopt)
-
-    if any(fnmatch.fnmatch(str(collection_path), str(glob)) for glob in ignore_globs):
-        return True
-
-    allow_in_venv = config.getoption("collect_in_virtualenv")
-    if not allow_in_venv and _in_venv(collection_path):
-        return True
-
-    if collection_path.is_dir():
-        norecursepatterns = config.getini("norecursedirs")
-        if any(fnmatch_ex(pat, collection_path) for pat in norecursepatterns):
-            return True
-
-    return None
-
-
-def pytest_collect_directory(
-    path: Path, parent: nodes.Collector
-) -> nodes.Collector | None:
-    return Dir.from_parent(parent, path=path)
-
-
-def pytest_collection_modifyitems(items: list[nodes.Item], config: Config) -> None:
-    deselect_prefixes = tuple(config.getoption("deselect") or [])
-    if not deselect_prefixes:
+def _check_frozen(model_cls: type[BaseModel], name: str, value: Any) -> None:
+    if model_cls.model_config.get('frozen'):
+        error_type = 'frozen_instance'
+    elif getattr(model_cls.__pydantic_fields__.get(name), 'frozen', False):
+        error_type = 'frozen_field'
+    else:
         return
 
-    remaining = []
-    deselected = []
-    for colitem in items:
-        if colitem.nodeid.startswith(deselect_prefixes):
-            deselected.append(colitem)
-        else:
-            remaining.append(colitem)
-
-    if deselected:
-        config.hook.pytest_deselected(items=deselected)
-        items[:] = remaining
+    raise ValidationError.from_exception_data(
+        model_cls.__name__, [{'type': error_type, 'loc': (name,), 'input': value}]
+    )
 
 
-class FSHookProxy:
-    def __init__(
-        self,
-        pm: PytestPluginManager,
-        remove_mods: AbstractSet[object],
-    ) -> None:
-        self.pm = pm
-        self.remove_mods = remove_mods
-
-    def __getattr__(self, name: str) -> pluggy.HookCaller:
-        x = self.pm.subset_hook_caller(name, remove_plugins=self.remove_mods)
-        self.__dict__[name] = x
-        return x
+def _model_field_setattr_handler(model: BaseModel, name: str, val: Any) -> None:
+    model.__dict__[name] = val
+    model.__pydantic_fields_set__.add(name)
 
 
-class Interrupted(KeyboardInterrupt):
-    """Signals that the test run was interrupted."""
-
-    __module__ = "builtins"  # For py3.
-
-
-class Failed(Exception):
-    """Signals a stop as failed test run."""
-
-
-@dataclasses.dataclass
-class _bestrelpath_cache(dict[Path, str]):
-    __slots__ = ("path",)
-
-    path: Path
-
-    def __missing__(self, path: Path) -> str:
-        r = bestrelpath(self.path, path)
-        self[path] = r
-        return r
+def _private_setattr_handler(model: BaseModel, name: str, val: Any) -> None:
+    if getattr(model, '__pydantic_private__', None) is None:
+        # While the attribute should be present at this point, this may not be the case if
+        # users do unusual stuff with `model_post_init()` (which is where the  `__pydantic_private__`
+        # is initialized, by wrapping the user-defined `model_post_init()`), e.g. if they mock
+        # the `model_post_init()` call. Ideally we should find a better way to init private attrs.
+        object.__setattr__(model, '__pydantic_private__', {})
+    model.__pydantic_private__[name] = val  # pyright: ignore[reportOptionalSubscript]
 
 
-@final
-class Dir(nodes.Directory):
-    """Collector of files in a file system directory.
+_SIMPLE_SETATTR_HANDLERS: Mapping[str, Callable[[BaseModel, str, Any], None]] = {
+    'model_field': _model_field_setattr_handler,
+    'validate_assignment': lambda model, name, val: model.__pydantic_validator__.validate_assignment(model, name, val),  # pyright: ignore[reportAssignmentType]
+    'private': _private_setattr_handler,
+    'cached_property': lambda model, name, val: model.__dict__.__setitem__(name, val),
+    'extra_known': lambda model, name, val: _object_setattr(model, name, val),
+}
 
-    .. versionadded:: 8.0
 
-    .. note::
+class BaseModel(metaclass=_model_construction.ModelMetaclass):
+    """!!! abstract "Usage Documentation"
+        [Models](../concepts/models.md)
 
-        Python directories with an `__init__.py` file are instead collected by
-        :class:`~pytest.Package` by default. Both are :class:`~pytest.Directory`
-        collectors.
+    A base class for creating Pydantic models.
+
+    Attributes:
+        __class_vars__: The names of the class variables defined on the model.
+        __private_attributes__: Metadata about the private attributes of the model.
+        __signature__: The synthesized `__init__` [`Signature`][inspect.Signature] of the model.
+
+        __pydantic_complete__: Whether model building is completed, or if there are still undefined fields.
+        __pydantic_core_schema__: The core schema of the model.
+        __pydantic_custom_init__: Whether the model has a custom `__init__` function.
+        __pydantic_decorators__: Metadata containing the decorators defined on the model.
+            This replaces `Model.__validators__` and `Model.__root_validators__` from Pydantic V1.
+        __pydantic_generic_metadata__: Metadata for generic models; contains data used for a similar purpose to
+            __args__, __origin__, __parameters__ in typing-module generics. May eventually be replaced by these.
+        __pydantic_parent_namespace__: Parent namespace of the model, used for automatic rebuilding of models.
+        __pydantic_post_init__: The name of the post-init method for the model, if defined.
+        __pydantic_root_model__: Whether the model is a [`RootModel`][pydantic.root_model.RootModel].
+        __pydantic_serializer__: The `pydantic-core` `SchemaSerializer` used to dump instances of the model.
+        __pydantic_validator__: The `pydantic-core` `SchemaValidator` used to validate instances of the model.
+
+        __pydantic_fields__: A dictionary of field names and their corresponding [`FieldInfo`][pydantic.fields.FieldInfo] objects.
+        __pydantic_computed_fields__: A dictionary of computed field names and their corresponding [`ComputedFieldInfo`][pydantic.fields.ComputedFieldInfo] objects.
+
+        __pydantic_extra__: A dictionary containing extra values, if [`extra`][pydantic.config.ConfigDict.extra]
+            is set to `'allow'`.
+        __pydantic_fields_set__: The names of fields explicitly set during instantiation.
+        __pydantic_private__: Values of private attributes set on the model instance.
     """
 
-    @classmethod
-    def from_parent(  # type: ignore[override]
-        cls,
-        parent: nodes.Collector,
-        *,
-        path: Path,
-    ) -> Self:
-        """The public constructor.
+    # Note: Many of the below class vars are defined in the metaclass, but we define them here for type checking purposes.
 
-        :param parent: The parent collector of this Dir.
-        :param path: The directory's path.
-        :type path: pathlib.Path
-        """
-        return super().from_parent(parent=parent, path=path)
-
-    def collect(self) -> Iterable[nodes.Item | nodes.Collector]:
-        config = self.config
-        col: nodes.Collector | None
-        cols: Sequence[nodes.Collector]
-        ihook = self.ihook
-        for direntry in scandir(self.path):
-            if direntry.is_dir():
-                path = Path(direntry.path)
-                if not self.session.isinitpath(path, with_parents=True):
-                    if ihook.pytest_ignore_collect(collection_path=path, config=config):
-                        continue
-                col = ihook.pytest_collect_directory(path=path, parent=self)
-                if col is not None:
-                    yield col
-
-            elif direntry.is_file():
-                path = Path(direntry.path)
-                if not self.session.isinitpath(path):
-                    if ihook.pytest_ignore_collect(collection_path=path, config=config):
-                        continue
-                cols = ihook.pytest_collect_file(file_path=path, parent=self)
-                yield from cols
-
-
-@final
-class Session(nodes.Collector):
-    """The root of the collection tree.
-
-    ``Session`` collects the initial paths given as arguments to pytest.
+    model_config: ClassVar[ConfigDict] = ConfigDict()
+    """
+    Configuration for the model, should be a dictionary conforming to [`ConfigDict`][pydantic.config.ConfigDict].
     """
 
-    Interrupted = Interrupted
-    Failed = Failed
-    # Set on the session by runner.pytest_sessionstart.
-    _setupstate: SetupState
-    # Set on the session by fixtures.pytest_sessionstart.
-    _fixturemanager: FixtureManager
-    exitstatus: int | ExitCode
+    __class_vars__: ClassVar[set[str]]
+    """The names of the class variables defined on the model."""
 
-    def __init__(self, config: Config) -> None:
-        super().__init__(
-            name="",
-            path=config.rootpath,
-            fspath=None,
-            parent=None,
-            config=config,
-            session=self,
-            nodeid="",
+    __private_attributes__: ClassVar[Dict[str, ModelPrivateAttr]]  # noqa: UP006
+    """Metadata about the private attributes of the model."""
+
+    __signature__: ClassVar[Signature]
+    """The synthesized `__init__` [`Signature`][inspect.Signature] of the model."""
+
+    __pydantic_complete__: ClassVar[bool] = False
+    """Whether model building is completed, or if there are still undefined fields."""
+
+    __pydantic_core_schema__: ClassVar[CoreSchema]
+    """The core schema of the model."""
+
+    __pydantic_custom_init__: ClassVar[bool]
+    """Whether the model has a custom `__init__` method."""
+
+    # Must be set for `GenerateSchema.model_schema` to work for a plain `BaseModel` annotation.
+    __pydantic_decorators__: ClassVar[_decorators.DecoratorInfos] = _decorators.DecoratorInfos()
+    """Metadata containing the decorators defined on the model.
+    This replaces `Model.__validators__` and `Model.__root_validators__` from Pydantic V1."""
+
+    __pydantic_generic_metadata__: ClassVar[_generics.PydanticGenericMetadata]
+    """Metadata for generic models; contains data used for a similar purpose to
+    __args__, __origin__, __parameters__ in typing-module generics. May eventually be replaced by these."""
+
+    __pydantic_parent_namespace__: ClassVar[Dict[str, Any] | None] = None  # noqa: UP006
+    """Parent namespace of the model, used for automatic rebuilding of models."""
+
+    __pydantic_post_init__: ClassVar[None | Literal['model_post_init']]
+    """The name of the post-init method for the model, if defined."""
+
+    __pydantic_root_model__: ClassVar[bool] = False
+    """Whether the model is a [`RootModel`][pydantic.root_model.RootModel]."""
+
+    __pydantic_serializer__: ClassVar[SchemaSerializer]
+    """The `pydantic-core` `SchemaSerializer` used to dump instances of the model."""
+
+    __pydantic_validator__: ClassVar[SchemaValidator | PluggableSchemaValidator]
+    """The `pydantic-core` `SchemaValidator` used to validate instances of the model."""
+
+    __pydantic_fields__: ClassVar[Dict[str, FieldInfo]]  # noqa: UP006
+    """A dictionary of field names and their corresponding [`FieldInfo`][pydantic.fields.FieldInfo] objects.
+    This replaces `Model.__fields__` from Pydantic V1.
+    """
+
+    __pydantic_setattr_handlers__: ClassVar[Dict[str, Callable[[BaseModel, str, Any], None]]]  # noqa: UP006
+    """`__setattr__` handlers. Memoizing the handlers leads to a dramatic performance improvement in `__setattr__`"""
+
+    __pydantic_computed_fields__: ClassVar[Dict[str, ComputedFieldInfo]]  # noqa: UP006
+    """A dictionary of computed field names and their corresponding [`ComputedFieldInfo`][pydantic.fields.ComputedFieldInfo] objects."""
+
+    __pydantic_extra__: dict[str, Any] | None = _model_construction.NoInitField(init=False)
+    """A dictionary containing extra values, if [`extra`][pydantic.config.ConfigDict.extra] is set to `'allow'`."""
+
+    __pydantic_fields_set__: set[str] = _model_construction.NoInitField(init=False)
+    """The names of fields explicitly set during instantiation."""
+
+    __pydantic_private__: dict[str, Any] | None = _model_construction.NoInitField(init=False)
+    """Values of private attributes set on the model instance."""
+
+    if not TYPE_CHECKING:
+        # Prevent `BaseModel` from being instantiated directly
+        # (defined in an `if not TYPE_CHECKING` block for clarity and to avoid type checking errors):
+        __pydantic_core_schema__ = _mock_val_ser.MockCoreSchema(
+            'Pydantic models should inherit from BaseModel, BaseModel cannot be instantiated directly',
+            code='base-model-instantiated',
         )
-        self.testsfailed = 0
-        self.testscollected = 0
-        self._shouldstop: bool | str = False
-        self._shouldfail: bool | str = False
-        self.trace = config.trace.root.get("collection")
-        self._initialpaths: frozenset[Path] = frozenset()
-        self._initialpaths_with_parents: frozenset[Path] = frozenset()
-        self._notfound: list[tuple[str, Sequence[nodes.Collector]]] = []
-        self._initial_parts: list[CollectionArgument] = []
-        self._collection_cache: dict[nodes.Collector, CollectReport] = {}
-        self.items: list[nodes.Item] = []
+        __pydantic_validator__ = _mock_val_ser.MockValSer(
+            'Pydantic models should inherit from BaseModel, BaseModel cannot be instantiated directly',
+            val_or_ser='validator',
+            code='base-model-instantiated',
+        )
+        __pydantic_serializer__ = _mock_val_ser.MockValSer(
+            'Pydantic models should inherit from BaseModel, BaseModel cannot be instantiated directly',
+            val_or_ser='serializer',
+            code='base-model-instantiated',
+        )
 
-        self._bestrelpathcache: dict[Path, str] = _bestrelpath_cache(config.rootpath)
+    __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
 
-        self.config.pluginmanager.register(self, name="session")
+    def __init__(self, /, **data: Any) -> None:
+        """Create a new model by parsing and validating input data from keyword arguments.
+
+        Raises [`ValidationError`][pydantic_core.ValidationError] if the input data cannot be
+        validated to form a valid model.
+
+        `self` is explicitly positional-only to allow `self` as a field name.
+        """
+        # `__tracebackhide__` tells pytest and some other tools to omit this function from tracebacks
+        __tracebackhide__ = True
+        validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+        if self is not validated_self:
+            warnings.warn(
+                'A custom validator is returning a value other than `self`.\n'
+                "Returning anything other than `self` from a top level model validator isn't supported when validating via `__init__`.\n"
+                'See the `model_validator` docs (https://docs.pydantic.dev/latest/concepts/validators/#model-validators) for more details.',
+                stacklevel=2,
+            )
+
+    # The following line sets a flag that we use to determine when `__init__` gets overridden by the user
+    __init__.__pydantic_base_init__ = True  # pyright: ignore[reportFunctionMemberAccess]
+
+    @_utils.deprecated_instance_property
+    @classmethod
+    def model_fields(cls) -> dict[str, FieldInfo]:
+        """A mapping of field names to their respective [`FieldInfo`][pydantic.fields.FieldInfo] instances.
+
+        !!! warning
+            Accessing this attribute from a model instance is deprecated, and will not work in Pydantic V3.
+            Instead, you should access this attribute from the model class.
+        """
+        return getattr(cls, '__pydantic_fields__', {})
+
+    @_utils.deprecated_instance_property
+    @classmethod
+    def model_computed_fields(cls) -> dict[str, ComputedFieldInfo]:
+        """A mapping of computed field names to their respective [`ComputedFieldInfo`][pydantic.fields.ComputedFieldInfo] instances.
+
+        !!! warning
+            Accessing this attribute from a model instance is deprecated, and will not work in Pydantic V3.
+            Instead, you should access this attribute from the model class.
+        """
+        return getattr(cls, '__pydantic_computed_fields__', {})
+
+    @property
+    def model_extra(self) -> dict[str, Any] | None:
+        """Get extra fields set during validation.
+
+        Returns:
+            A dictionary of extra fields, or `None` if `config.extra` is not set to `"allow"`.
+        """
+        return self.__pydantic_extra__
+
+    @property
+    def model_fields_set(self) -> set[str]:
+        """Returns the set of fields that have been explicitly set on this model instance.
+
+        Returns:
+            A set of strings representing the fields that have been set,
+                i.e. that were not filled from defaults.
+        """
+        return self.__pydantic_fields_set__
 
     @classmethod
-    def from_config(cls, config: Config) -> Session:
-        session: Session = cls._create(config=config)
-        return session
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: Any) -> Self:  # noqa: C901
+        """Creates a new instance of the `Model` class with validated data.
+
+        Creates a new model setting `__dict__` and `__pydantic_fields_set__` from trusted or pre-validated data.
+        Default values are respected, but no other validation is performed.
+
+        !!! note
+            `model_construct()` generally respects the `model_config.extra` setting on the provided model.
+            That is, if `model_config.extra == 'allow'`, then all extra passed values are added to the model instance's `__dict__`
+            and `__pydantic_extra__` fields. If `model_config.extra == 'ignore'` (the default), then all extra passed values are ignored.
+            Because no validation is performed with a call to `model_construct()`, having `model_config.extra == 'forbid'` does not result in
+            an error if extra values are passed, but they will be ignored.
+
+        Args:
+            _fields_set: A set of field names that were originally explicitly set during instantiation. If provided,
+                this is directly used for the [`model_fields_set`][pydantic.BaseModel.model_fields_set] attribute.
+                Otherwise, the field names from the `values` argument will be used.
+            values: Trusted or pre-validated data dictionary.
+
+        Returns:
+            A new instance of the `Model` class with validated data.
+        """
+        m = cls.__new__(cls)
+        fields_values: dict[str, Any] = {}
+        fields_set = set()
+
+        for name, field in cls.__pydantic_fields__.items():
+            if field.alias is not None and field.alias in values:
+                fields_values[name] = values.pop(field.alias)
+                fields_set.add(name)
+
+            if (name not in fields_set) and (field.validation_alias is not None):
+                validation_aliases: list[str | AliasPath] = (
+                    field.validation_alias.choices
+                    if isinstance(field.validation_alias, AliasChoices)
+                    else [field.validation_alias]
+                )
+
+                for alias in validation_aliases:
+                    if isinstance(alias, str) and alias in values:
+                        fields_values[name] = values.pop(alias)
+                        fields_set.add(name)
+                        break
+                    elif isinstance(alias, AliasPath):
+                        value = alias.search_dict_for_path(values)
+                        if value is not PydanticUndefined:
+                            fields_values[name] = value
+                            fields_set.add(name)
+                            break
+
+            if name not in fields_set:
+                if name in values:
+                    fields_values[name] = values.pop(name)
+                    fields_set.add(name)
+                elif not field.is_required():
+                    fields_values[name] = field.get_default(call_default_factory=True, validated_data=fields_values)
+        if _fields_set is None:
+            _fields_set = fields_set
+
+        _extra: dict[str, Any] | None = values if cls.model_config.get('extra') == 'allow' else None
+        _object_setattr(m, '__dict__', fields_values)
+        _object_setattr(m, '__pydantic_fields_set__', _fields_set)
+        if not cls.__pydantic_root_model__:
+            _object_setattr(m, '__pydantic_extra__', _extra)
+
+        if cls.__pydantic_post_init__:
+            m.model_post_init(None)
+            # update private attributes with values set
+            if hasattr(m, '__pydantic_private__') and m.__pydantic_private__ is not None:
+                for k, v in values.items():
+                    if k in m.__private_attributes__:
+                        m.__pydantic_private__[k] = v
+
+        elif not cls.__pydantic_root_model__:
+            # Note: if there are any private attributes, cls.__pydantic_post_init__ would exist
+            # Since it doesn't, that means that `__pydantic_private__` should be set to None
+            _object_setattr(m, '__pydantic_private__', None)
+
+        return m
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        """!!! abstract "Usage Documentation"
+            [`model_copy`](../concepts/serialization.md#model_copy)
+
+        Returns a copy of the model.
+
+        !!! note
+            The underlying instance's [`__dict__`][object.__dict__] attribute is copied. This
+            might have unexpected side effects if you store anything in it, on top of the model
+            fields (e.g. the value of [cached properties][functools.cached_property]).
+
+        Args:
+            update: Values to change/add in the new model. Note: the data is not validated
+                before creating the new model. You should trust this data.
+            deep: Set to `True` to make a deep copy of the model.
+
+        Returns:
+            New model instance.
+        """
+        copied = self.__deepcopy__() if deep else self.__copy__()
+        if update:
+            if self.model_config.get('extra') == 'allow':
+                for k, v in update.items():
+                    if k in self.__pydantic_fields__:
+                        copied.__dict__[k] = v
+                    else:
+                        if copied.__pydantic_extra__ is None:
+                            copied.__pydantic_extra__ = {}
+                        copied.__pydantic_extra__[k] = v
+            else:
+                copied.__dict__.update(update)
+            copied.__pydantic_fields_set__.update(update.keys())
+        return copied
+
+    def model_dump(
+        self,
+        *,
+        mode: Literal['json', 'python'] | str = 'python',
+        include: IncEx | None = None,
+        exclude: IncEx | None = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        exclude_unset: bool = False,
+        exclude_defaults: bool = False,
+        exclude_none: bool = False,
+        round_trip: bool = False,
+        warnings: bool | Literal['none', 'warn', 'error'] = True,
+        fallback: Callable[[Any], Any] | None = None,
+        serialize_as_any: bool = False,
+    ) -> dict[str, Any]:
+        """!!! abstract "Usage Documentation"
+            [`model_dump`](../concepts/serialization.md#modelmodel_dump)
+
+        Generate a dictionary representation of the model, optionally specifying which fields to include or exclude.
+
+        Args:
+            mode: The mode in which `to_python` should run.
+                If mode is 'json', the output will only contain JSON serializable types.
+                If mode is 'python', the output may contain non-JSON-serializable Python objects.
+            include: A set of fields to include in the output.
+            exclude: A set of fields to exclude from the output.
+            context: Additional context to pass to the serializer.
+            by_alias: Whether to use the field's alias in the dictionary key if defined.
+            exclude_unset: Whether to exclude fields that have not been explicitly set.
+            exclude_defaults: Whether to exclude fields that are set to their default value.
+            exclude_none: Whether to exclude fields that have a value of `None`.
+            round_trip: If True, dumped values should be valid as input for non-idempotent types such as Json[T].
+            warnings: How to handle serialization errors. False/"none" ignores them, True/"warn" logs errors,
+                "error" raises a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError].
+            fallback: A function to call when an unknown value is encountered. If not provided,
+                a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError] error is raised.
+            serialize_as_any: Whether to serialize fields with duck-typing serialization behavior.
+
+        Returns:
+            A dictionary representation of the model.
+        """
+        return self.__pydantic_serializer__.to_python(
+            self,
+            mode=mode,
+            by_alias=by_alias,
+            include=include,
+            exclude=exclude,
+            context=context,
+            exclude_unset=exclude_unset,
+            exclude_defaults=exclude_defaults,
+            exclude_none=exclude_none,
+            round_trip=round_trip,
+            warnings=warnings,
+            fallback=fallback,
+            serialize_as_any=serialize_as_any,
+        )
+
+    def model_dump_json(
+        self,
+        *,
+        indent: int | None = None,
+        include: IncEx | None = None,
+        exclude: IncEx | None = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        exclude_unset: bool = False,
+        exclude_defaults: bool = False,
+        exclude_none: bool = False,
+        round_trip: bool = False,
+        warnings: bool | Literal['none', 'warn', 'error'] = True,
+        fallback: Callable[[Any], Any] | None = None,
+        serialize_as_any: bool = False,
+    ) -> str:
+        """!!! abstract "Usage Documentation"
+            [`model_dump_json`](../concepts/serialization.md#modelmodel_dump_json)
+
+        Generates a JSON representation of the model using Pydantic's `to_json` method.
+
+        Args:
+            indent: Indentation to use in the JSON output. If None is passed, the output will be compact.
+            include: Field(s) to include in the JSON output.
+            exclude: Field(s) to exclude from the JSON output.
+            context: Additional context to pass to the serializer.
+            by_alias: Whether to serialize using field aliases.
+            exclude_unset: Whether to exclude fields that have not been explicitly set.
+            exclude_defaults: Whether to exclude fields that are set to their default value.
+            exclude_none: Whether to exclude fields that have a value of `None`.
+            round_trip: If True, dumped values should be valid as input for non-idempotent types such as Json[T].
+            warnings: How to handle serialization errors. False/"none" ignores them, True/"warn" logs errors,
+                "error" raises a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError].
+            fallback: A function to call when an unknown value is encountered. If not provided,
+                a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError] error is raised.
+            serialize_as_any: Whether to serialize fields with duck-typing serialization behavior.
+
+        Returns:
+            A JSON string representation of the model.
+        """
+        return self.__pydantic_serializer__.to_json(
+            self,
+            indent=indent,
+            include=include,
+            exclude=exclude,
+            context=context,
+            by_alias=by_alias,
+            exclude_unset=exclude_unset,
+            exclude_defaults=exclude_defaults,
+            exclude_none=exclude_none,
+            round_trip=round_trip,
+            warnings=warnings,
+            fallback=fallback,
+            serialize_as_any=serialize_as_any,
+        ).decode()
+
+    @classmethod
+    def model_json_schema(
+        cls,
+        by_alias: bool = True,
+        ref_template: str = DEFAULT_REF_TEMPLATE,
+        schema_generator: type[GenerateJsonSchema] = GenerateJsonSchema,
+        mode: JsonSchemaMode = 'validation',
+    ) -> dict[str, Any]:
+        """Generates a JSON schema for a model class.
+
+        Args:
+            by_alias: Whether to use attribute aliases or not.
+            ref_template: The reference template.
+            schema_generator: To override the logic used to generate the JSON schema, as a subclass of
+                `GenerateJsonSchema` with your desired modifications
+            mode: The mode in which to generate the schema.
+
+        Returns:
+            The JSON schema for the given model class.
+        """
+        return model_json_schema(
+            cls, by_alias=by_alias, ref_template=ref_template, schema_generator=schema_generator, mode=mode
+        )
+
+    @classmethod
+    def model_parametrized_name(cls, params: tuple[type[Any], ...]) -> str:
+        """Compute the class name for parametrizations of generic classes.
+
+        This method can be overridden to achieve a custom naming scheme for generic BaseModels.
+
+        Args:
+            params: Tuple of types of the class. Given a generic class
+                `Model` with 2 type variables and a concrete model `Model[str, int]`,
+                the value `(str, int)` would be passed to `params`.
+
+        Returns:
+            String representing the new class where `params` are passed to `cls` as type variables.
+
+        Raises:
+            TypeError: Raised when trying to generate concrete names for non-generic models.
+        """
+        if not issubclass(cls, typing.Generic):
+            raise TypeError('Concrete names should only be generated for generic models.')
+
+        # Any strings received should represent forward references, so we handle them specially below.
+        # If we eventually move toward wrapping them in a ForwardRef in __class_getitem__ in the future,
+        # we may be able to remove this special case.
+        param_names = [param if isinstance(param, str) else _repr.display_as_type(param) for param in params]
+        params_component = ', '.join(param_names)
+        return f'{cls.__name__}[{params_component}]'
+
+    def model_post_init(self, context: Any, /) -> None:
+        """Override this method to perform additional initialization after `__init__` and `model_construct`.
+        This is useful if you want to do some validation that requires the entire model to be initialized.
+        """
+        pass
+
+    @classmethod
+    def model_rebuild(
+        cls,
+        *,
+        force: bool = False,
+        raise_errors: bool = True,
+        _parent_namespace_depth: int = 2,
+        _types_namespace: MappingNamespace | None = None,
+    ) -> bool | None:
+        """Try to rebuild the pydantic-core schema for the model.
+
+        This may be necessary when one of the annotations is a ForwardRef which could not be resolved during
+        the initial attempt to build the schema, and automatic rebuilding fails.
+
+        Args:
+            force: Whether to force the rebuilding of the model schema, defaults to `False`.
+            raise_errors: Whether to raise errors, defaults to `True`.
+            _parent_namespace_depth: The depth level of the parent namespace, defaults to 2.
+            _types_namespace: The types namespace, defaults to `None`.
+
+        Returns:
+            Returns `None` if the schema is already "complete" and rebuilding was not required.
+            If rebuilding _was_ required, returns `True` if rebuilding was successful, otherwise `False`.
+        """
+        if not force and cls.__pydantic_complete__:
+            return None
+
+        for attr in ('__pydantic_core_schema__', '__pydantic_validator__', '__pydantic_serializer__'):
+            if attr in cls.__dict__ and not isinstance(getattr(cls, attr), _mock_val_ser.MockValSer):
+                # Deleting the validator/serializer is necessary as otherwise they can get reused in
+                # pydantic-core. We do so only if they aren't mock instances, otherwise — as `model_rebuild()`
+                # isn't thread-safe — concurrent model instantiations can lead to the parent validator being used.
+                # Same applies for the core schema that can be reused in schema generation.
+                delattr(cls, attr)
+
+        cls.__pydantic_complete__ = False
+
+        if _types_namespace is not None:
+            rebuild_ns = _types_namespace
+        elif _parent_namespace_depth > 0:
+            rebuild_ns = _typing_extra.parent_frame_namespace(parent_depth=_parent_namespace_depth, force=True) or {}
+        else:
+            rebuild_ns = {}
+
+        parent_ns = _model_construction.unpack_lenient_weakvaluedict(cls.__pydantic_parent_namespace__) or {}
+
+        ns_resolver = _namespace_utils.NsResolver(
+            parent_namespace={**rebuild_ns, **parent_ns},
+        )
+
+        if not cls.__pydantic_fields_complete__:
+            typevars_map = _generics.get_model_typevars_map(cls)
+            try:
+                cls.__pydantic_fields__ = _fields.rebuild_model_fields(
+                    cls,
+                    ns_resolver=ns_resolver,
+                    typevars_map=typevars_map,
+                )
+            except NameError as e:
+                exc = PydanticUndefinedAnnotation.from_name_error(e)
+                _mock_val_ser.set_model_mocks(cls, f'`{exc.name}`')
+                if raise_errors:
+                    raise exc from e
+
+            if not raise_errors and not cls.__pydantic_fields_complete__:
+                # No need to continue with schema gen, it is guaranteed to fail
+                return False
+
+            assert cls.__pydantic_fields_complete__
+
+        return _model_construction.complete_model_class(
+            cls,
+            _config.ConfigWrapper(cls.model_config, check=False),
+            raise_errors=raise_errors,
+            ns_resolver=ns_resolver,
+        )
+
+    @classmethod
+    def model_validate(
+        cls,
+        obj: Any,
+        *,
+        strict: bool | None = None,
+        from_attributes: bool | None = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        """Validate a pydantic model instance.
+
+        Args:
+            obj: The object to validate.
+            strict: Whether to enforce types strictly.
+            from_attributes: Whether to extract data from object attributes.
+            context: Additional context to pass to the validator.
+            by_alias: Whether to use the field's alias when validating against the provided input data.
+            by_name: Whether to use the field's name when validating against the provided input data.
+
+        Raises:
+            ValidationError: If the object could not be validated.
+
+        Returns:
+            The validated model instance.
+        """
+        # `__tracebackhide__` tells pytest and some other tools to omit this function from tracebacks
+        __tracebackhide__ = True
+
+        if by_alias is False and by_name is not True:
+            raise PydanticUserError(
+                'At least one of `by_alias` or `by_name` must be set to True.',
+                code='validate-by-alias-and-name-false',
+            )
+
+        return cls.__pydantic_validator__.validate_python(
+            obj, strict=strict, from_attributes=from_attributes, context=context, by_alias=by_alias, by_name=by_name
+        )
+
+    @classmethod
+    def model_validate_json(
+        cls,
+        json_data: str | bytes | bytearray,
+        *,
+        strict: bool | None = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        """!!! abstract "Usage Documentation"
+            [JSON Parsing](../concepts/json.md#json-parsing)
+
+        Validate the given JSON data against the Pydantic model.
+
+        Args:
+            json_data: The JSON data to validate.
+            strict: Whether to enforce types strictly.
+            context: Extra variables to pass to the validator.
+            by_alias: Whether to use the field's alias when validating against the provided input data.
+            by_name: Whether to use the field's name when validating against the provided input data.
+
+        Returns:
+            The validated Pydantic model.
+
+        Raises:
+            ValidationError: If `json_data` is not a JSON string or the object could not be validated.
+        """
+        # `__tracebackhide__` tells pytest and some other tools to omit this function from tracebacks
+        __tracebackhide__ = True
+
+        if by_alias is False and by_name is not True:
+            raise PydanticUserError(
+                'At least one of `by_alias` or `by_name` must be set to True.',
+                code='validate-by-alias-and-name-false',
+            )
+
+        return cls.__pydantic_validator__.validate_json(
+            json_data, strict=strict, context=context, by_alias=by_alias, by_name=by_name
+        )
+
+    @classmethod
+    def model_validate_strings(
+        cls,
+        obj: Any,
+        *,
+        strict: bool | None = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        """Validate the given object with string data against the Pydantic model.
+
+        Args:
+            obj: The object containing string data to validate.
+            strict: Whether to enforce types strictly.
+            context: Extra variables to pass to the validator.
+            by_alias: Whether to use the field's alias when validating against the provided input data.
+            by_name: Whether to use the field's name when validating against the provided input data.
+
+        Returns:
+            The validated Pydantic model.
+        """
+        # `__tracebackhide__` tells pytest and some other tools to omit this function from tracebacks
+        __tracebackhide__ = True
+
+        if by_alias is False and by_name is not True:
+            raise PydanticUserError(
+                'At least one of `by_alias` or `by_name` must be set to True.',
+                code='validate-by-alias-and-name-false',
+            )
+
+        return cls.__pydantic_validator__.validate_strings(
+            obj, strict=strict, context=context, by_alias=by_alias, by_name=by_name
+        )
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: type[BaseModel], handler: GetCoreSchemaHandler, /) -> CoreSchema:
+        # This warning is only emitted when calling `super().__get_pydantic_core_schema__` from a model subclass.
+        # In the generate schema logic, this method (`BaseModel.__get_pydantic_core_schema__`) is special cased to
+        # *not* be called if not overridden.
+        warnings.warn(
+            'The `__get_pydantic_core_schema__` method of the `BaseModel` class is deprecated. If you are calling '
+            '`super().__get_pydantic_core_schema__` when overriding the method on a Pydantic model, consider using '
+            '`handler(source)` instead. However, note that overriding this method on models can lead to unexpected '
+            'side effects.',
+            PydanticDeprecatedSince211,
+            stacklevel=2,
+        )
+        # Logic copied over from `GenerateSchema._model_schema`:
+        schema = cls.__dict__.get('__pydantic_core_schema__')
+        if schema is not None and not isinstance(schema, _mock_val_ser.MockCoreSchema):
+            return cls.__pydantic_core_schema__
+
+        return handler(source)
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls,
+        core_schema: CoreSchema,
+        handler: GetJsonSchemaHandler,
+        /,
+    ) -> JsonSchemaValue:
+        """Hook into generating the model's JSON schema.
+
+        Args:
+            core_schema: A `pydantic-core` CoreSchema.
+                You can ignore this argument and call the handler with a new CoreSchema,
+                wrap this CoreSchema (`{'type': 'nullable', 'schema': current_schema}`),
+                or just call the handler with the original schema.
+            handler: Call into Pydantic's internal JSON schema generation.
+                This will raise a `pydantic.errors.PydanticInvalidForJsonSchema` if JSON schema
+                generation fails.
+                Since this gets called by `BaseModel.model_json_schema` you can override the
+                `schema_generator` argument to that function to change JSON schema generation globally
+                for a type.
+
+        Returns:
+            A JSON schema, as a Python object.
+        """
+        return handler(core_schema)
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
+        """This is intended to behave just like `__init_subclass__`, but is called by `ModelMetaclass`
+        only after the class is actually fully initialized. In particular, attributes like `model_fields` will
+        be present when this is called.
+
+        This is necessary because `__init_subclass__` will always be called by `type.__new__`,
+        and it would require a prohibitively large refactor to the `ModelMetaclass` to ensure that
+        `type.__new__` was called in such a manner that the class would already be sufficiently initialized.
+
+        This will receive the same `kwargs` that would be passed to the standard `__init_subclass__`, namely,
+        any kwargs passed to the class definition that aren't used internally by pydantic.
+
+        Args:
+            **kwargs: Any keyword arguments passed to the class definition that aren't used internally
+                by pydantic.
+        """
+        pass
+
+    def __class_getitem__(
+        cls, typevar_values: type[Any] | tuple[type[Any], ...]
+    ) -> type[BaseModel] | _forward_ref.PydanticRecursiveRef:
+        cached = _generics.get_cached_generic_type_early(cls, typevar_values)
+        if cached is not None:
+            return cached
+
+        if cls is BaseModel:
+            raise TypeError('Type parameters should be placed on typing.Generic, not BaseModel')
+        if not hasattr(cls, '__parameters__'):
+            raise TypeError(f'{cls} cannot be parametrized because it does not inherit from typing.Generic')
+        if not cls.__pydantic_generic_metadata__['parameters'] and typing.Generic not in cls.__bases__:
+            raise TypeError(f'{cls} is not a generic class')
+
+        if not isinstance(typevar_values, tuple):
+            typevar_values = (typevar_values,)
+
+        # For a model `class Model[T, U, V = int](BaseModel): ...` parametrized with `(str, bool)`,
+        # this gives us `{T: str, U: bool, V: int}`:
+        typevars_map = _generics.map_generic_model_arguments(cls, typevar_values)
+        # We also update the provided args to use defaults values (`(str, bool)` becomes `(str, bool, int)`):
+        typevar_values = tuple(v for v in typevars_map.values())
+
+        if _utils.all_identical(typevars_map.keys(), typevars_map.values()) and typevars_map:
+            submodel = cls  # if arguments are equal to parameters it's the same object
+            _generics.set_cached_generic_type(cls, typevar_values, submodel)
+        else:
+            parent_args = cls.__pydantic_generic_metadata__['args']
+            if not parent_args:
+                args = typevar_values
+            else:
+                args = tuple(_generics.replace_types(arg, typevars_map) for arg in parent_args)
+
+            origin = cls.__pydantic_generic_metadata__['origin'] or cls
+            model_name = origin.model_parametrized_name(args)
+            params = tuple(
+                {param: None for param in _generics.iter_contained_typevars(typevars_map.values())}
+            )  # use dict as ordered set
+
+            with _generics.generic_recursion_self_type(origin, args) as maybe_self_type:
+                cached = _generics.get_cached_generic_type_late(cls, typevar_values, origin, args)
+                if cached is not None:
+                    return cached
+
+                if maybe_self_type is not None:
+                    return maybe_self_type
+
+                # Attempt to rebuild the origin in case new types have been defined
+                try:
+                    # depth 2 gets you above this __class_getitem__ call.
+                    # Note that we explicitly provide the parent ns, otherwise
+                    # `model_rebuild` will use the parent ns no matter if it is the ns of a module.
+                    # We don't want this here, as this has unexpected effects when a model
+                    # is being parametrized during a forward annotation evaluation.
+                    parent_ns = _typing_extra.parent_frame_namespace(parent_depth=2) or {}
+                    origin.model_rebuild(_types_namespace=parent_ns)
+                except PydanticUndefinedAnnotation:
+                    # It's okay if it fails, it just means there are still undefined types
+                    # that could be evaluated later.
+                    pass
+
+                submodel = _generics.create_generic_submodel(model_name, origin, args, params)
+
+                _generics.set_cached_generic_type(cls, typevar_values, submodel, origin, args)
+
+        return submodel
+
+    def __copy__(self) -> Self:
+        """Returns a shallow copy of the model."""
+        cls = type(self)
+        m = cls.__new__(cls)
+        _object_setattr(m, '__dict__', copy(self.__dict__))
+        _object_setattr(m, '__pydantic_extra__', copy(self.__pydantic_extra__))
+        _object_setattr(m, '__pydantic_fields_set__', copy(self.__pydantic_fields_set__))
+
+        if not hasattr(self, '__pydantic_private__') or self.__pydantic_private__ is None:
+            _object_setattr(m, '__pydantic_private__', None)
+        else:
+            _object_setattr(
+                m,
+                '__pydantic_private__',
+                {k: v for k, v in self.__pydantic_private__.items() if v is not PydanticUndefined},
+            )
+
+        return m
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        """Returns a deep copy of the model."""
+        cls = type(self)
+        m = cls.__new__(cls)
+        _object_setattr(m, '__dict__', deepcopy(self.__dict__, memo=memo))
+        _object_setattr(m, '__pydantic_extra__', deepcopy(self.__pydantic_extra__, memo=memo))
+        # This next line doesn't need a deepcopy because __pydantic_fields_set__ is a set[str],
+        # and attempting a deepcopy would be marginally slower.
+        _object_setattr(m, '__pydantic_fields_set__', copy(self.__pydantic_fields_set__))
+
+        if not hasattr(self, '__pydantic_private__') or self.__pydantic_private__ is None:
+            _object_setattr(m, '__pydantic_private__', None)
+        else:
+            _object_setattr(
+                m,
+                '__pydantic_private__',
+                deepcopy({k: v for k, v in self.__pydantic_private__.items() if v is not PydanticUndefined}, memo=memo),
+            )
+
+        return m
+
+    if not TYPE_CHECKING:
+        # We put `__getattr__` in a non-TYPE_CHECKING block because otherwise, mypy allows arbitrary attribute access
+        # The same goes for __setattr__ and __delattr__, see: https://github.com/pydantic/pydantic/issues/8643
+
+        def __getattr__(self, item: str) -> Any:
+            private_attributes = object.__getattribute__(self, '__private_attributes__')
+            if item in private_attributes:
+                attribute = private_attributes[item]
+                if hasattr(attribute, '__get__'):
+                    return attribute.__get__(self, type(self))  # type: ignore
+
+                try:
+                    # Note: self.__pydantic_private__ cannot be None if self.__private_attributes__ has items
+                    return self.__pydantic_private__[item]  # type: ignore
+                except KeyError as exc:
+                    raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}') from exc
+            else:
+                # `__pydantic_extra__` can fail to be set if the model is not yet fully initialized.
+                # See `BaseModel.__repr_args__` for more details
+                try:
+                    pydantic_extra = object.__getattribute__(self, '__pydantic_extra__')
+                except AttributeError:
+                    pydantic_extra = None
+
+                if pydantic_extra:
+                    try:
+                        return pydantic_extra[item]
+                    except KeyError as exc:
+                        raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}') from exc
+                else:
+                    if hasattr(self.__class__, item):
+                        return super().__getattribute__(item)  # Raises AttributeError if appropriate
+                    else:
+                        # this is the current error
+                        raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            if (setattr_handler := self.__pydantic_setattr_handlers__.get(name)) is not None:
+                setattr_handler(self, name, value)
+            # if None is returned from _setattr_handler, the attribute was set directly
+            elif (setattr_handler := self._setattr_handler(name, value)) is not None:
+                setattr_handler(self, name, value)  # call here to not memo on possibly unknown fields
+                self.__pydantic_setattr_handlers__[name] = setattr_handler  # memoize the handler for faster access
+
+        def _setattr_handler(self, name: str, value: Any) -> Callable[[BaseModel, str, Any], None] | None:
+            """Get a handler for setting an attribute on the model instance.
+
+            Returns:
+                A handler for setting an attribute on the model instance. Used for memoization of the handler.
+                Memoizing the handlers leads to a dramatic performance improvement in `__setattr__`
+                Returns `None` when memoization is not safe, then the attribute is set directly.
+            """
+            cls = self.__class__
+            if name in cls.__class_vars__:
+                raise AttributeError(
+                    f'{name!r} is a ClassVar of `{cls.__name__}` and cannot be set on an instance. '
+                    f'If you want to set a value on the class, use `{cls.__name__}.{name} = value`.'
+                )
+            elif not _fields.is_valid_field_name(name):
+                if (attribute := cls.__private_attributes__.get(name)) is not None:
+                    if hasattr(attribute, '__set__'):
+                        return lambda model, _name, val: attribute.__set__(model, val)
+                    else:
+                        return _SIMPLE_SETATTR_HANDLERS['private']
+                else:
+                    _object_setattr(self, name, value)
+                    return None  # Can not return memoized handler with possibly freeform attr names
+
+            attr = getattr(cls, name, None)
+            # NOTE: We currently special case properties and `cached_property`, but we might need
+            # to generalize this to all data/non-data descriptors at some point. For non-data descriptors
+            # (such as `cached_property`), it isn't obvious though. `cached_property` caches the value
+            # to the instance's `__dict__`, but other non-data descriptors might do things differently.
+            if isinstance(attr, cached_property):
+                return _SIMPLE_SETATTR_HANDLERS['cached_property']
+
+            _check_frozen(cls, name, value)
+
+            # We allow properties to be set only on non frozen models for now (to match dataclasses).
+            # This can be changed if it ever gets requested.
+            if isinstance(attr, property):
+                return lambda model, _name, val: attr.__set__(model, val)
+            elif cls.model_config.get('validate_assignment'):
+                return _SIMPLE_SETATTR_HANDLERS['validate_assignment']
+            elif name not in cls.__pydantic_fields__:
+                if cls.model_config.get('extra') != 'allow':
+                    # TODO - matching error
+                    raise ValueError(f'"{cls.__name__}" object has no field "{name}"')
+                elif attr is None:
+                    # attribute does not exist, so put it in extra
+                    self.__pydantic_extra__[name] = value
+                    return None  # Can not return memoized handler with possibly freeform attr names
+                else:
+                    # attribute _does_ exist, and was not in extra, so update it
+                    return _SIMPLE_SETATTR_HANDLERS['extra_known']
+            else:
+                return _SIMPLE_SETATTR_HANDLERS['model_field']
+
+        def __delattr__(self, item: str) -> Any:
+            cls = self.__class__
+
+            if item in self.__private_attributes__:
+                attribute = self.__private_attributes__[item]
+                if hasattr(attribute, '__delete__'):
+                    attribute.__delete__(self)  # type: ignore
+                    return
+
+                try:
+                    # Note: self.__pydantic_private__ cannot be None if self.__private_attributes__ has items
+                    del self.__pydantic_private__[item]  # type: ignore
+                    return
+                except KeyError as exc:
+                    raise AttributeError(f'{cls.__name__!r} object has no attribute {item!r}') from exc
+
+            # Allow cached properties to be deleted (even if the class is frozen):
+            attr = getattr(cls, item, None)
+            if isinstance(attr, cached_property):
+                return object.__delattr__(self, item)
+
+            _check_frozen(cls, name=item, value=None)
+
+            if item in self.__pydantic_fields__:
+                object.__delattr__(self, item)
+            elif self.__pydantic_extra__ is not None and item in self.__pydantic_extra__:
+                del self.__pydantic_extra__[item]
+            else:
+                try:
+                    object.__delattr__(self, item)
+                except AttributeError:
+                    raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
+
+        # Because we make use of `@dataclass_transform()`, `__replace__` is already synthesized by
+        # type checkers, so we define the implementation in this `if not TYPE_CHECKING:` block:
+        def __replace__(self, **changes: Any) -> Self:
+            return self.model_copy(update=changes)
+
+    def __getstate__(self) -> dict[Any, Any]:
+        private = self.__pydantic_private__
+        if private:
+            private = {k: v for k, v in private.items() if v is not PydanticUndefined}
+        return {
+            '__dict__': self.__dict__,
+            '__pydantic_extra__': self.__pydantic_extra__,
+            '__pydantic_fields_set__': self.__pydantic_fields_set__,
+            '__pydantic_private__': private,
+        }
+
+    def __setstate__(self, state: dict[Any, Any]) -> None:
+        _object_setattr(self, '__pydantic_fields_set__', state.get('__pydantic_fields_set__', {}))
+        _object_setattr(self, '__pydantic_extra__', state.get('__pydantic_extra__', {}))
+        _object_setattr(self, '__pydantic_private__', state.get('__pydantic_private__', {}))
+        _object_setattr(self, '__dict__', state.get('__dict__', {}))
+
+    if not TYPE_CHECKING:
+
+        def __eq__(self, other: Any) -> bool:
+            if isinstance(other, BaseModel):
+                # When comparing instances of generic types for equality, as long as all field values are equal,
+                # only require their generic origin types to be equal, rather than exact type equality.
+                # This prevents headaches like MyGeneric(x=1) != MyGeneric[Any](x=1).
+                self_type = self.__pydantic_generic_metadata__['origin'] or self.__class__
+                other_type = other.__pydantic_generic_metadata__['origin'] or other.__class__
+
+                # Perform common checks first
+                if not (
+                    self_type == other_type
+                    and getattr(self, '__pydantic_private__', None) == getattr(other, '__pydantic_private__', None)
+                    and self.__pydantic_extra__ == other.__pydantic_extra__
+                ):
+                    return False
+
+                # We only want to compare pydantic fields but ignoring fields is costly.
+                # We'll perform a fast check first, and fallback only when needed
+                # See GH-7444 and GH-7825 for rationale and a performance benchmark
+
+                # First, do the fast (and sometimes faulty) __dict__ comparison
+                if self.__dict__ == other.__dict__:
+                    # If the check above passes, then pydantic fields are equal, we can return early
+                    return True
+
+                # We don't want to trigger unnecessary costly filtering of __dict__ on all unequal objects, so we return
+                # early if there are no keys to ignore (we would just return False later on anyway)
+                model_fields = type(self).__pydantic_fields__.keys()
+                if self.__dict__.keys() <= model_fields and other.__dict__.keys() <= model_fields:
+                    return False
+
+                # If we reach here, there are non-pydantic-fields keys, mapped to unequal values, that we need to ignore
+                # Resort to costly filtering of the __dict__ objects
+                # We use operator.itemgetter because it is much faster than dict comprehensions
+                # NOTE: Contrary to standard python class and instances, when the Model class has a default value for an
+                # attribute and the model instance doesn't have a corresponding attribute, accessing the missing attribute
+                # raises an error in BaseModel.__getattr__ instead of returning the class attribute
+                # So we can use operator.itemgetter() instead of operator.attrgetter()
+                getter = operator.itemgetter(*model_fields) if model_fields else lambda _: _utils._SENTINEL
+                try:
+                    return getter(self.__dict__) == getter(other.__dict__)
+                except KeyError:
+                    # In rare cases (such as when using the deprecated BaseModel.copy() method),
+                    # the __dict__ may not contain all model fields, which is how we can get here.
+                    # getter(self.__dict__) is much faster than any 'safe' method that accounts
+                    # for missing keys, and wrapping it in a `try` doesn't slow things down much
+                    # in the common case.
+                    self_fields_proxy = _utils.SafeGetItemProxy(self.__dict__)
+                    other_fields_proxy = _utils.SafeGetItemProxy(other.__dict__)
+                    return getter(self_fields_proxy) == getter(other_fields_proxy)
+
+            # other instance is not a BaseModel
+            else:
+                return NotImplemented  # delegate to the other item in the comparison
+
+    if TYPE_CHECKING:
+        # We put `__init_subclass__` in a TYPE_CHECKING block because, even though we want the type-checking benefits
+        # described in the signature of `__init_subclass__` below, we don't want to modify the default behavior of
+        # subclass initialization.
+
+        def __init_subclass__(cls, **kwargs: Unpack[ConfigDict]):
+            """This signature is included purely to help type-checkers check arguments to class declaration, which
+            provides a way to conveniently set model_config key/value pairs.
+
+            ```python
+            from pydantic import BaseModel
+
+            class MyModel(BaseModel, extra='allow'): ...
+            ```
+
+            However, this may be deceiving, since the _actual_ calls to `__init_subclass__` will not receive any
+            of the config arguments, and will only receive any keyword arguments passed during class initialization
+            that are _not_ expected keys in ConfigDict. (This is due to the way `ModelMetaclass.__new__` works.)
+
+            Args:
+                **kwargs: Keyword arguments passed to the class definition, which set model_config
+
+            Note:
+                You may want to override `__pydantic_init_subclass__` instead, which behaves similarly but is called
+                *after* the class is fully initialized.
+            """
+
+    def __iter__(self) -> TupleGenerator:
+        """So `dict(model)` works."""
+        yield from [(k, v) for (k, v) in self.__dict__.items() if not k.startswith('_')]
+        extra = self.__pydantic_extra__
+        if extra:
+            yield from extra.items()
 
     def __repr__(self) -> str:
-        return (
-            f"<{self.__class__.__name__} {self.name} "
-            f"exitstatus=%r "
-            f"testsfailed={self.testsfailed} "
-            f"testscollected={self.testscollected}>"
-        ) % getattr(self, "exitstatus", "<UNSET>")
+        return f'{self.__repr_name__()}({self.__repr_str__(", ")})'
 
-    @property
-    def shouldstop(self) -> bool | str:
-        return self._shouldstop
+    def __repr_args__(self) -> _repr.ReprArgs:
+        # Eagerly create the repr of computed fields, as this may trigger access of cached properties and as such
+        # modify the instance's `__dict__`. If we don't do it now, it could happen when iterating over the `__dict__`
+        # below if the instance happens to be referenced in a field, and would modify the `__dict__` size *during* iteration.
+        computed_fields_repr_args = [
+            (k, getattr(self, k)) for k, v in self.__pydantic_computed_fields__.items() if v.repr
+        ]
 
-    @shouldstop.setter
-    def shouldstop(self, value: bool | str) -> None:
-        # The runner checks shouldfail and assumes that if it is set we are
-        # definitely stopping, so prevent unsetting it.
-        if value is False and self._shouldstop:
-            warnings.warn(
-                PytestWarning(
-                    "session.shouldstop cannot be unset after it has been set; ignoring."
-                ),
-                stacklevel=2,
-            )
-            return
-        self._shouldstop = value
-
-    @property
-    def shouldfail(self) -> bool | str:
-        return self._shouldfail
-
-    @shouldfail.setter
-    def shouldfail(self, value: bool | str) -> None:
-        # The runner checks shouldfail and assumes that if it is set we are
-        # definitely stopping, so prevent unsetting it.
-        if value is False and self._shouldfail:
-            warnings.warn(
-                PytestWarning(
-                    "session.shouldfail cannot be unset after it has been set; ignoring."
-                ),
-                stacklevel=2,
-            )
-            return
-        self._shouldfail = value
-
-    @property
-    def startpath(self) -> Path:
-        """The path from which pytest was invoked.
-
-        .. versionadded:: 7.0.0
-        """
-        return self.config.invocation_params.dir
-
-    def _node_location_to_relpath(self, node_path: Path) -> str:
-        # bestrelpath is a quite slow function.
-        return self._bestrelpathcache[node_path]
-
-    @hookimpl(tryfirst=True)
-    def pytest_collectstart(self) -> None:
-        if self.shouldfail:
-            raise self.Failed(self.shouldfail)
-        if self.shouldstop:
-            raise self.Interrupted(self.shouldstop)
-
-    @hookimpl(tryfirst=True)
-    def pytest_runtest_logreport(self, report: TestReport | CollectReport) -> None:
-        if report.failed and not hasattr(report, "wasxfail"):
-            self.testsfailed += 1
-            maxfail = self.config.getvalue("maxfail")
-            if maxfail and self.testsfailed >= maxfail:
-                self.shouldfail = f"stopping after {self.testsfailed} failures"
-
-    pytest_collectreport = pytest_runtest_logreport
-
-    def isinitpath(
-        self,
-        path: str | os.PathLike[str],
-        *,
-        with_parents: bool = False,
-    ) -> bool:
-        """Is path an initial path?
-
-        An initial path is a path explicitly given to pytest on the command
-        line.
-
-        :param with_parents:
-            If set, also return True if the path is a parent of an initial path.
-
-        .. versionchanged:: 8.0
-            Added the ``with_parents`` parameter.
-        """
-        # Optimization: Path(Path(...)) is much slower than isinstance.
-        path_ = path if isinstance(path, Path) else Path(path)
-        if with_parents:
-            return path_ in self._initialpaths_with_parents
-        else:
-            return path_ in self._initialpaths
-
-    def gethookproxy(self, fspath: os.PathLike[str]) -> pluggy.HookRelay:
-        # Optimization: Path(Path(...)) is much slower than isinstance.
-        path = fspath if isinstance(fspath, Path) else Path(fspath)
-        pm = self.config.pluginmanager
-        # Check if we have the common case of running
-        # hooks with all conftest.py files.
-        my_conftestmodules = pm._getconftestmodules(path)
-        remove_mods = pm._conftest_plugins.difference(my_conftestmodules)
-        proxy: pluggy.HookRelay
-        if remove_mods:
-            # One or more conftests are not in use at this path.
-            proxy = PathAwareHookProxy(FSHookProxy(pm, remove_mods))  # type: ignore[arg-type,assignment]
-        else:
-            # All plugins are active for this fspath.
-            proxy = self.config.hook
-        return proxy
-
-    def _collect_path(
-        self,
-        path: Path,
-        path_cache: dict[Path, Sequence[nodes.Collector]],
-    ) -> Sequence[nodes.Collector]:
-        """Create a Collector for the given path.
-
-        `path_cache` makes it so the same Collectors are returned for the same
-        path.
-        """
-        if path in path_cache:
-            return path_cache[path]
-
-        if path.is_dir():
-            ihook = self.gethookproxy(path.parent)
-            col: nodes.Collector | None = ihook.pytest_collect_directory(
-                path=path, parent=self
-            )
-            cols: Sequence[nodes.Collector] = (col,) if col is not None else ()
-
-        elif path.is_file():
-            ihook = self.gethookproxy(path)
-            cols = ihook.pytest_collect_file(file_path=path, parent=self)
-
-        else:
-            # Broken symlink or invalid/missing file.
-            cols = ()
-
-        path_cache[path] = cols
-        return cols
-
-    @overload
-    def perform_collect(
-        self, args: Sequence[str] | None = ..., genitems: Literal[True] = ...
-    ) -> Sequence[nodes.Item]: ...
-
-    @overload
-    def perform_collect(
-        self, args: Sequence[str] | None = ..., genitems: bool = ...
-    ) -> Sequence[nodes.Item | nodes.Collector]: ...
-
-    def perform_collect(
-        self, args: Sequence[str] | None = None, genitems: bool = True
-    ) -> Sequence[nodes.Item | nodes.Collector]:
-        """Perform the collection phase for this session.
-
-        This is called by the default :hook:`pytest_collection` hook
-        implementation; see the documentation of this hook for more details.
-        For testing purposes, it may also be called directly on a fresh
-        ``Session``.
-
-        This function normally recursively expands any collectors collected
-        from the session to their items, and only items are returned. For
-        testing purposes, this may be suppressed by passing ``genitems=False``,
-        in which case the return value contains these collectors unexpanded,
-        and ``session.items`` is empty.
-        """
-        if args is None:
-            args = self.config.args
-
-        self.trace("perform_collect", self, args)
-        self.trace.root.indent += 1
-
-        hook = self.config.hook
-
-        self._notfound = []
-        self._initial_parts = []
-        self._collection_cache = {}
-        self.items = []
-        items: Sequence[nodes.Item | nodes.Collector] = self.items
-        try:
-            initialpaths: list[Path] = []
-            initialpaths_with_parents: list[Path] = []
-            for arg in args:
-                collection_argument = resolve_collection_argument(
-                    self.config.invocation_params.dir,
-                    arg,
-                    as_pypath=self.config.option.pyargs,
-                )
-                self._initial_parts.append(collection_argument)
-                initialpaths.append(collection_argument.path)
-                initialpaths_with_parents.append(collection_argument.path)
-                initialpaths_with_parents.extend(collection_argument.path.parents)
-            self._initialpaths = frozenset(initialpaths)
-            self._initialpaths_with_parents = frozenset(initialpaths_with_parents)
-
-            rep = collect_one_node(self)
-            self.ihook.pytest_collectreport(report=rep)
-            self.trace.root.indent -= 1
-            if self._notfound:
-                errors = []
-                for arg, collectors in self._notfound:
-                    if collectors:
-                        errors.append(
-                            f"not found: {arg}\n(no match in any of {collectors!r})"
-                        )
-                    else:
-                        errors.append(f"found no collectors for {arg}")
-
-                raise UsageError(*errors)
-
-            if not genitems:
-                items = rep.result
-            else:
-                if rep.passed:
-                    for node in rep.result:
-                        self.items.extend(self.genitems(node))
-
-            self.config.pluginmanager.check_pending()
-            hook.pytest_collection_modifyitems(
-                session=self, config=self.config, items=items
-            )
-        finally:
-            self._notfound = []
-            self._initial_parts = []
-            self._collection_cache = {}
-            hook.pytest_collection_finish(session=self)
-
-        if genitems:
-            self.testscollected = len(items)
-
-        return items
-
-    def _collect_one_node(
-        self,
-        node: nodes.Collector,
-        handle_dupes: bool = True,
-    ) -> tuple[CollectReport, bool]:
-        if node in self._collection_cache and handle_dupes:
-            rep = self._collection_cache[node]
-            return rep, True
-        else:
-            rep = collect_one_node(node)
-            self._collection_cache[node] = rep
-            return rep, False
-
-    def collect(self) -> Iterator[nodes.Item | nodes.Collector]:
-        # This is a cache for the root directories of the initial paths.
-        # We can't use collection_cache for Session because of its special
-        # role as the bootstrapping collector.
-        path_cache: dict[Path, Sequence[nodes.Collector]] = {}
-
-        pm = self.config.pluginmanager
-
-        for collection_argument in self._initial_parts:
-            self.trace("processing argument", collection_argument)
-            self.trace.root.indent += 1
-
-            argpath = collection_argument.path
-            names = collection_argument.parts
-            module_name = collection_argument.module_name
-
-            # resolve_collection_argument() ensures this.
-            if argpath.is_dir():
-                assert not names, f"invalid arg {(argpath, names)!r}"
-
-            paths = [argpath]
-            # Add relevant parents of the path, from the root, e.g.
-            #   /a/b/c.py -> [/, /a, /a/b, /a/b/c.py]
-            if module_name is None:
-                # Paths outside of the confcutdir should not be considered.
-                for path in argpath.parents:
-                    if not pm._is_in_confcutdir(path):
-                        break
-                    paths.insert(0, path)
-            else:
-                # For --pyargs arguments, only consider paths matching the module
-                # name. Paths beyond the package hierarchy are not included.
-                module_name_parts = module_name.split(".")
-                for i, path in enumerate(argpath.parents, 2):
-                    if i > len(module_name_parts) or path.stem != module_name_parts[-i]:
-                        break
-                    paths.insert(0, path)
-
-            # Start going over the parts from the root, collecting each level
-            # and discarding all nodes which don't match the level's part.
-            any_matched_in_initial_part = False
-            notfound_collectors = []
-            work: list[tuple[nodes.Collector | nodes.Item, list[Path | str]]] = [
-                (self, [*paths, *names])
-            ]
-            while work:
-                matchnode, matchparts = work.pop()
-
-                # Pop'd all of the parts, this is a match.
-                if not matchparts:
-                    yield matchnode
-                    any_matched_in_initial_part = True
-                    continue
-
-                # Should have been matched by now, discard.
-                if not isinstance(matchnode, nodes.Collector):
-                    continue
-
-                # Collect this level of matching.
-                # Collecting Session (self) is done directly to avoid endless
-                # recursion to this function.
-                subnodes: Sequence[nodes.Collector | nodes.Item]
-                if isinstance(matchnode, Session):
-                    assert isinstance(matchparts[0], Path)
-                    subnodes = matchnode._collect_path(matchparts[0], path_cache)
+        for k, v in self.__dict__.items():
+            field = self.__pydantic_fields__.get(k)
+            if field and field.repr:
+                if v is not self:
+                    yield k, v
                 else:
-                    # For backward compat, files given directly multiple
-                    # times on the command line should not be deduplicated.
-                    handle_dupes = not (
-                        len(matchparts) == 1
-                        and isinstance(matchparts[0], Path)
-                        and matchparts[0].is_file()
-                    )
-                    rep, duplicate = self._collect_one_node(matchnode, handle_dupes)
-                    if not duplicate and not rep.passed:
-                        # Report collection failures here to avoid failing to
-                        # run some test specified in the command line because
-                        # the module could not be imported (#134).
-                        matchnode.ihook.pytest_collectreport(report=rep)
-                    if not rep.passed:
-                        continue
-                    subnodes = rep.result
+                    yield k, self.__repr_recursion__(v)
+        # `__pydantic_extra__` can fail to be set if the model is not yet fully initialized.
+        # This can happen if a `ValidationError` is raised during initialization and the instance's
+        # repr is generated as part of the exception handling. Therefore, we use `getattr` here
+        # with a fallback, even though the type hints indicate the attribute will always be present.
+        try:
+            pydantic_extra = object.__getattribute__(self, '__pydantic_extra__')
+        except AttributeError:
+            pydantic_extra = None
 
-                # Prune this level.
-                any_matched_in_collector = False
-                for node in reversed(subnodes):
-                    # Path part e.g. `/a/b/` in `/a/b/test_file.py::TestIt::test_it`.
-                    if isinstance(matchparts[0], Path):
-                        is_match = node.path == matchparts[0]
-                        if sys.platform == "win32" and not is_match:
-                            # In case the file paths do not match, fallback to samefile() to
-                            # account for short-paths on Windows (#11895).
-                            same_file = os.path.samefile(node.path, matchparts[0])
-                            # We don't want to match links to the current node,
-                            # otherwise we would match the same file more than once (#12039).
-                            is_match = same_file and (
-                                os.path.islink(node.path)
-                                == os.path.islink(matchparts[0])
-                            )
+        if pydantic_extra is not None:
+            yield from ((k, v) for k, v in pydantic_extra.items())
+        yield from computed_fields_repr_args
 
-                    # Name part e.g. `TestIt` in `/a/b/test_file.py::TestIt::test_it`.
-                    else:
-                        # TODO: Remove parametrized workaround once collection structure contains
-                        # parametrization.
-                        is_match = (
-                            node.name == matchparts[0]
-                            or node.name.split("[")[0] == matchparts[0]
-                        )
-                    if is_match:
-                        work.append((node, matchparts[1:]))
-                        any_matched_in_collector = True
+    # take logic from `_repr.Representation` without the side effects of inheritance, see #5740
+    __repr_name__ = _repr.Representation.__repr_name__
+    __repr_recursion__ = _repr.Representation.__repr_recursion__
+    __repr_str__ = _repr.Representation.__repr_str__
+    __pretty__ = _repr.Representation.__pretty__
+    __rich_repr__ = _repr.Representation.__rich_repr__
 
-                if not any_matched_in_collector:
-                    notfound_collectors.append(matchnode)
+    def __str__(self) -> str:
+        return self.__repr_str__(' ')
 
-            if not any_matched_in_initial_part:
-                report_arg = "::".join((str(argpath), *names))
-                self._notfound.append((report_arg, notfound_collectors))
-
-            self.trace.root.indent -= 1
-
-    def genitems(self, node: nodes.Item | nodes.Collector) -> Iterator[nodes.Item]:
-        self.trace("genitems", node)
-        if isinstance(node, nodes.Item):
-            node.ihook.pytest_itemcollected(item=node)
-            yield node
-        else:
-            assert isinstance(node, nodes.Collector)
-            keepduplicates = self.config.getoption("keepduplicates")
-            # For backward compat, dedup only applies to files.
-            handle_dupes = not (keepduplicates and isinstance(node, nodes.File))
-            rep, duplicate = self._collect_one_node(node, handle_dupes)
-            if duplicate and not keepduplicates:
-                return
-            if rep.passed:
-                for subnode in rep.result:
-                    yield from self.genitems(subnode)
-            if not duplicate:
-                node.ihook.pytest_collectreport(report=rep)
-
-
-def search_pypath(module_name: str) -> str | None:
-    """Search sys.path for the given a dotted module name, and return its file
-    system path if found."""
-    try:
-        spec = importlib.util.find_spec(module_name)
-    # AttributeError: looks like package module, but actually filename
-    # ImportError: module does not exist
-    # ValueError: not a module name
-    except (AttributeError, ImportError, ValueError):
-        return None
-    if spec is None or spec.origin is None or spec.origin == "namespace":
-        return None
-    elif spec.submodule_search_locations:
-        return os.path.dirname(spec.origin)
-    else:
-        return spec.origin
-
-
-@dataclasses.dataclass(frozen=True)
-class CollectionArgument:
-    """A resolved collection argument."""
-
-    path: Path
-    parts: Sequence[str]
-    module_name: str | None
-
-
-def resolve_collection_argument(
-    invocation_path: Path, arg: str, *, as_pypath: bool = False
-) -> CollectionArgument:
-    """Parse path arguments optionally containing selection parts and return (fspath, names).
-
-    Command-line arguments can point to files and/or directories, and optionally contain
-    parts for specific tests selection, for example:
-
-        "pkg/tests/test_foo.py::TestClass::test_foo"
-
-    This function ensures the path exists, and returns a resolved `CollectionArgument`:
-
-        CollectionArgument(
-            path=Path("/full/path/to/pkg/tests/test_foo.py"),
-            parts=["TestClass", "test_foo"],
-            module_name=None,
-        )
-
-    When as_pypath is True, expects that the command-line argument actually contains
-    module paths instead of file-system paths:
-
-        "pkg.tests.test_foo::TestClass::test_foo"
-
-    In which case we search sys.path for a matching module, and then return the *path* to the
-    found module, which may look like this:
-
-        CollectionArgument(
-            path=Path("/home/u/myvenv/lib/site-packages/pkg/tests/test_foo.py"),
-            parts=["TestClass", "test_foo"],
-            module_name="pkg.tests.test_foo",
-        )
-
-    If the path doesn't exist, raise UsageError.
-    If the path is a directory and selection parts are present, raise UsageError.
-    """
-    base, squacket, rest = str(arg).partition("[")
-    strpath, *parts = base.split("::")
-    if parts:
-        parts[-1] = f"{parts[-1]}{squacket}{rest}"
-    module_name = None
-    if as_pypath:
-        pyarg_strpath = search_pypath(strpath)
-        if pyarg_strpath is not None:
-            module_name = strpath
-            strpath = pyarg_strpath
-    fspath = invocation_path / strpath
-    fspath = absolutepath(fspath)
-    if not safe_exists(fspath):
-        msg = (
-            "module or package not found: {arg} (missing __init__.py?)"
-            if as_pypath
-            else "file or directory not found: {arg}"
-        )
-        raise UsageError(msg.format(arg=arg))
-    if parts and fspath.is_dir():
-        msg = (
-            "package argument cannot contain :: selection parts: {arg}"
-            if as_pypath
-            else "directory argument cannot contain :: selection parts: {arg}"
-        )
-        raise UsageError(msg.format(arg=arg))
-    return CollectionArgument(
-        path=fspath,
-        parts=parts,
-        module_name=module_name,
+    # ##### Deprecated methods from v1 #####
+    @property
+    @typing_extensions.deprecated(
+        'The `__fields__` attribute is deprecated, use `model_fields` instead.', category=None
     )
+    def __fields__(self) -> dict[str, FieldInfo]:
+        warnings.warn(
+            'The `__fields__` attribute is deprecated, use `model_fields` instead.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        return getattr(type(self), '__pydantic_fields__', {})
+
+    @property
+    @typing_extensions.deprecated(
+        'The `__fields_set__` attribute is deprecated, use `model_fields_set` instead.',
+        category=None,
+    )
+    def __fields_set__(self) -> set[str]:
+        warnings.warn(
+            'The `__fields_set__` attribute is deprecated, use `model_fields_set` instead.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        return self.__pydantic_fields_set__
+
+    @typing_extensions.deprecated('The `dict` method is deprecated; use `model_dump` instead.', category=None)
+    def dict(  # noqa: D102
+        self,
+        *,
+        include: IncEx | None = None,
+        exclude: IncEx | None = None,
+        by_alias: bool = False,
+        exclude_unset: bool = False,
+        exclude_defaults: bool = False,
+        exclude_none: bool = False,
+    ) -> Dict[str, Any]:  # noqa UP006
+        warnings.warn(
+            'The `dict` method is deprecated; use `model_dump` instead.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        return self.model_dump(
+            include=include,
+            exclude=exclude,
+            by_alias=by_alias,
+            exclude_unset=exclude_unset,
+            exclude_defaults=exclude_defaults,
+            exclude_none=exclude_none,
+        )
+
+    @typing_extensions.deprecated('The `json` method is deprecated; use `model_dump_json` instead.', category=None)
+    def json(  # noqa: D102
+        self,
+        *,
+        include: IncEx | None = None,
+        exclude: IncEx | None = None,
+        by_alias: bool = False,
+        exclude_unset: bool = False,
+        exclude_defaults: bool = False,
+        exclude_none: bool = False,
+        encoder: Callable[[Any], Any] | None = PydanticUndefined,  # type: ignore[assignment]
+        models_as_dict: bool = PydanticUndefined,  # type: ignore[assignment]
+        **dumps_kwargs: Any,
+    ) -> str:
+        warnings.warn(
+            'The `json` method is deprecated; use `model_dump_json` instead.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        if encoder is not PydanticUndefined:
+            raise TypeError('The `encoder` argument is no longer supported; use field serializers instead.')
+        if models_as_dict is not PydanticUndefined:
+            raise TypeError('The `models_as_dict` argument is no longer supported; use a model serializer instead.')
+        if dumps_kwargs:
+            raise TypeError('`dumps_kwargs` keyword arguments are no longer supported.')
+        return self.model_dump_json(
+            include=include,
+            exclude=exclude,
+            by_alias=by_alias,
+            exclude_unset=exclude_unset,
+            exclude_defaults=exclude_defaults,
+            exclude_none=exclude_none,
+        )
+
+    @classmethod
+    @typing_extensions.deprecated('The `parse_obj` method is deprecated; use `model_validate` instead.', category=None)
+    def parse_obj(cls, obj: Any) -> Self:  # noqa: D102
+        warnings.warn(
+            'The `parse_obj` method is deprecated; use `model_validate` instead.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        return cls.model_validate(obj)
+
+    @classmethod
+    @typing_extensions.deprecated(
+        'The `parse_raw` method is deprecated; if your data is JSON use `model_validate_json`, '
+        'otherwise load the data then use `model_validate` instead.',
+        category=None,
+    )
+    def parse_raw(  # noqa: D102
+        cls,
+        b: str | bytes,
+        *,
+        content_type: str | None = None,
+        encoding: str = 'utf8',
+        proto: DeprecatedParseProtocol | None = None,
+        allow_pickle: bool = False,
+    ) -> Self:  # pragma: no cover
+        warnings.warn(
+            'The `parse_raw` method is deprecated; if your data is JSON use `model_validate_json`, '
+            'otherwise load the data then use `model_validate` instead.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        from .deprecated import parse
+
+        try:
+            obj = parse.load_str_bytes(
+                b,
+                proto=proto,
+                content_type=content_type,
+                encoding=encoding,
+                allow_pickle=allow_pickle,
+            )
+        except (ValueError, TypeError) as exc:
+            import json
+
+            # try to match V1
+            if isinstance(exc, UnicodeDecodeError):
+                type_str = 'value_error.unicodedecode'
+            elif isinstance(exc, json.JSONDecodeError):
+                type_str = 'value_error.jsondecode'
+            elif isinstance(exc, ValueError):
+                type_str = 'value_error'
+            else:
+                type_str = 'type_error'
+
+            # ctx is missing here, but since we've added `input` to the error, we're not pretending it's the same
+            error: pydantic_core.InitErrorDetails = {
+                # The type: ignore on the next line is to ignore the requirement of LiteralString
+                'type': pydantic_core.PydanticCustomError(type_str, str(exc)),  # type: ignore
+                'loc': ('__root__',),
+                'input': b,
+            }
+            raise pydantic_core.ValidationError.from_exception_data(cls.__name__, [error])
+        return cls.model_validate(obj)
+
+    @classmethod
+    @typing_extensions.deprecated(
+        'The `parse_file` method is deprecated; load the data from file, then if your data is JSON '
+        'use `model_validate_json`, otherwise `model_validate` instead.',
+        category=None,
+    )
+    def parse_file(  # noqa: D102
+        cls,
+        path: str | Path,
+        *,
+        content_type: str | None = None,
+        encoding: str = 'utf8',
+        proto: DeprecatedParseProtocol | None = None,
+        allow_pickle: bool = False,
+    ) -> Self:
+        warnings.warn(
+            'The `parse_file` method is deprecated; load the data from file, then if your data is JSON '
+            'use `model_validate_json`, otherwise `model_validate` instead.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        from .deprecated import parse
+
+        obj = parse.load_file(
+            path,
+            proto=proto,
+            content_type=content_type,
+            encoding=encoding,
+            allow_pickle=allow_pickle,
+        )
+        return cls.parse_obj(obj)
+
+    @classmethod
+    @typing_extensions.deprecated(
+        'The `from_orm` method is deprecated; set '
+        "`model_config['from_attributes']=True` and use `model_validate` instead.",
+        category=None,
+    )
+    def from_orm(cls, obj: Any) -> Self:  # noqa: D102
+        warnings.warn(
+            'The `from_orm` method is deprecated; set '
+            "`model_config['from_attributes']=True` and use `model_validate` instead.",
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        if not cls.model_config.get('from_attributes', None):
+            raise PydanticUserError(
+                'You must set the config attribute `from_attributes=True` to use from_orm', code=None
+            )
+        return cls.model_validate(obj)
+
+    @classmethod
+    @typing_extensions.deprecated('The `construct` method is deprecated; use `model_construct` instead.', category=None)
+    def construct(cls, _fields_set: set[str] | None = None, **values: Any) -> Self:  # noqa: D102
+        warnings.warn(
+            'The `construct` method is deprecated; use `model_construct` instead.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        return cls.model_construct(_fields_set=_fields_set, **values)
+
+    @typing_extensions.deprecated(
+        'The `copy` method is deprecated; use `model_copy` instead. '
+        'See the docstring of `BaseModel.copy` for details about how to handle `include` and `exclude`.',
+        category=None,
+    )
+    def copy(
+        self,
+        *,
+        include: AbstractSetIntStr | MappingIntStrAny | None = None,
+        exclude: AbstractSetIntStr | MappingIntStrAny | None = None,
+        update: Dict[str, Any] | None = None,  # noqa UP006
+        deep: bool = False,
+    ) -> Self:  # pragma: no cover
+        """Returns a copy of the model.
+
+        !!! warning "Deprecated"
+            This method is now deprecated; use `model_copy` instead.
+
+        If you need `include` or `exclude`, use:
+
+        ```python {test="skip" lint="skip"}
+        data = self.model_dump(include=include, exclude=exclude, round_trip=True)
+        data = {**data, **(update or {})}
+        copied = self.model_validate(data)
+        ```
+
+        Args:
+            include: Optional set or mapping specifying which fields to include in the copied model.
+            exclude: Optional set or mapping specifying which fields to exclude in the copied model.
+            update: Optional dictionary of field-value pairs to override field values in the copied model.
+            deep: If True, the values of fields that are Pydantic models will be deep-copied.
+
+        Returns:
+            A copy of the model with included, excluded and updated fields as specified.
+        """
+        warnings.warn(
+            'The `copy` method is deprecated; use `model_copy` instead. '
+            'See the docstring of `BaseModel.copy` for details about how to handle `include` and `exclude`.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        from .deprecated import copy_internals
+
+        values = dict(
+            copy_internals._iter(
+                self, to_dict=False, by_alias=False, include=include, exclude=exclude, exclude_unset=False
+            ),
+            **(update or {}),
+        )
+        if self.__pydantic_private__ is None:
+            private = None
+        else:
+            private = {k: v for k, v in self.__pydantic_private__.items() if v is not PydanticUndefined}
+
+        if self.__pydantic_extra__ is None:
+            extra: dict[str, Any] | None = None
+        else:
+            extra = self.__pydantic_extra__.copy()
+            for k in list(self.__pydantic_extra__):
+                if k not in values:  # k was in the exclude
+                    extra.pop(k)
+            for k in list(values):
+                if k in self.__pydantic_extra__:  # k must have come from extra
+                    extra[k] = values.pop(k)
+
+        # new `__pydantic_fields_set__` can have unset optional fields with a set value in `update` kwarg
+        if update:
+            fields_set = self.__pydantic_fields_set__ | update.keys()
+        else:
+            fields_set = set(self.__pydantic_fields_set__)
+
+        # removing excluded fields from `__pydantic_fields_set__`
+        if exclude:
+            fields_set -= set(exclude)
+
+        return copy_internals._copy_and_set_values(self, values, fields_set, extra, private, deep=deep)
+
+    @classmethod
+    @typing_extensions.deprecated('The `schema` method is deprecated; use `model_json_schema` instead.', category=None)
+    def schema(  # noqa: D102
+        cls, by_alias: bool = True, ref_template: str = DEFAULT_REF_TEMPLATE
+    ) -> Dict[str, Any]:  # noqa UP006
+        warnings.warn(
+            'The `schema` method is deprecated; use `model_json_schema` instead.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        return cls.model_json_schema(by_alias=by_alias, ref_template=ref_template)
+
+    @classmethod
+    @typing_extensions.deprecated(
+        'The `schema_json` method is deprecated; use `model_json_schema` and json.dumps instead.',
+        category=None,
+    )
+    def schema_json(  # noqa: D102
+        cls, *, by_alias: bool = True, ref_template: str = DEFAULT_REF_TEMPLATE, **dumps_kwargs: Any
+    ) -> str:  # pragma: no cover
+        warnings.warn(
+            'The `schema_json` method is deprecated; use `model_json_schema` and json.dumps instead.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        import json
+
+        from .deprecated.json import pydantic_encoder
+
+        return json.dumps(
+            cls.model_json_schema(by_alias=by_alias, ref_template=ref_template),
+            default=pydantic_encoder,
+            **dumps_kwargs,
+        )
+
+    @classmethod
+    @typing_extensions.deprecated('The `validate` method is deprecated; use `model_validate` instead.', category=None)
+    def validate(cls, value: Any) -> Self:  # noqa: D102
+        warnings.warn(
+            'The `validate` method is deprecated; use `model_validate` instead.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        return cls.model_validate(value)
+
+    @classmethod
+    @typing_extensions.deprecated(
+        'The `update_forward_refs` method is deprecated; use `model_rebuild` instead.',
+        category=None,
+    )
+    def update_forward_refs(cls, **localns: Any) -> None:  # noqa: D102
+        warnings.warn(
+            'The `update_forward_refs` method is deprecated; use `model_rebuild` instead.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        if localns:  # pragma: no cover
+            raise TypeError('`localns` arguments are not longer accepted.')
+        cls.model_rebuild(force=True)
+
+    @typing_extensions.deprecated(
+        'The private method `_iter` will be removed and should no longer be used.', category=None
+    )
+    def _iter(self, *args: Any, **kwargs: Any) -> Any:
+        warnings.warn(
+            'The private method `_iter` will be removed and should no longer be used.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        from .deprecated import copy_internals
+
+        return copy_internals._iter(self, *args, **kwargs)
+
+    @typing_extensions.deprecated(
+        'The private method `_copy_and_set_values` will be removed and should no longer be used.',
+        category=None,
+    )
+    def _copy_and_set_values(self, *args: Any, **kwargs: Any) -> Any:
+        warnings.warn(
+            'The private method `_copy_and_set_values` will be removed and should no longer be used.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        from .deprecated import copy_internals
+
+        return copy_internals._copy_and_set_values(self, *args, **kwargs)
+
+    @classmethod
+    @typing_extensions.deprecated(
+        'The private method `_get_value` will be removed and should no longer be used.',
+        category=None,
+    )
+    def _get_value(cls, *args: Any, **kwargs: Any) -> Any:
+        warnings.warn(
+            'The private method `_get_value` will be removed and should no longer be used.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        from .deprecated import copy_internals
+
+        return copy_internals._get_value(cls, *args, **kwargs)
+
+    @typing_extensions.deprecated(
+        'The private method `_calculate_keys` will be removed and should no longer be used.',
+        category=None,
+    )
+    def _calculate_keys(self, *args: Any, **kwargs: Any) -> Any:
+        warnings.warn(
+            'The private method `_calculate_keys` will be removed and should no longer be used.',
+            category=PydanticDeprecatedSince20,
+            stacklevel=2,
+        )
+        from .deprecated import copy_internals
+
+        return copy_internals._calculate_keys(self, *args, **kwargs)
+
+
+ModelT = TypeVar('ModelT', bound=BaseModel)
+
+
+@overload
+def create_model(
+    model_name: str,
+    /,
+    *,
+    __config__: ConfigDict | None = None,
+    __doc__: str | None = None,
+    __base__: None = None,
+    __module__: str = __name__,
+    __validators__: dict[str, Callable[..., Any]] | None = None,
+    __cls_kwargs__: dict[str, Any] | None = None,
+    **field_definitions: Any | tuple[str, Any],
+) -> type[BaseModel]: ...
+
+
+@overload
+def create_model(
+    model_name: str,
+    /,
+    *,
+    __config__: ConfigDict | None = None,
+    __doc__: str | None = None,
+    __base__: type[ModelT] | tuple[type[ModelT], ...],
+    __module__: str = __name__,
+    __validators__: dict[str, Callable[..., Any]] | None = None,
+    __cls_kwargs__: dict[str, Any] | None = None,
+    **field_definitions: Any | tuple[str, Any],
+) -> type[ModelT]: ...
+
+
+def create_model(  # noqa: C901
+    model_name: str,
+    /,
+    *,
+    __config__: ConfigDict | None = None,
+    __doc__: str | None = None,
+    __base__: type[ModelT] | tuple[type[ModelT], ...] | None = None,
+    __module__: str | None = None,
+    __validators__: dict[str, Callable[..., Any]] | None = None,
+    __cls_kwargs__: dict[str, Any] | None = None,
+    # TODO PEP 747: replace `Any` by the TypeForm:
+    **field_definitions: Any | tuple[str, Any],
+) -> type[ModelT]:
+    """!!! abstract "Usage Documentation"
+        [Dynamic Model Creation](../concepts/models.md#dynamic-model-creation)
+
+    Dynamically creates and returns a new Pydantic model, in other words, `create_model` dynamically creates a
+    subclass of [`BaseModel`][pydantic.BaseModel].
+
+    Args:
+        model_name: The name of the newly created model.
+        __config__: The configuration of the new model.
+        __doc__: The docstring of the new model.
+        __base__: The base class or classes for the new model.
+        __module__: The name of the module that the model belongs to;
+            if `None`, the value is taken from `sys._getframe(1)`
+        __validators__: A dictionary of methods that validate fields. The keys are the names of the validation methods to
+            be added to the model, and the values are the validation methods themselves. You can read more about functional
+            validators [here](https://docs.pydantic.dev/2.9/concepts/validators/#field-validators).
+        __cls_kwargs__: A dictionary of keyword arguments for class creation, such as `metaclass`.
+        **field_definitions: Field definitions of the new model. Either:
+
+            - a single element, representing the type annotation of the field.
+            - a two-tuple, the first element being the type and the second element the assigned value
+              (either a default or the [`Field()`][pydantic.Field] function).
+
+    Returns:
+        The new [model][pydantic.BaseModel].
+
+    Raises:
+        PydanticUserError: If `__base__` and `__config__` are both passed.
+    """
+    if __base__ is None:
+        __base__ = (cast('type[ModelT]', BaseModel),)
+    elif not isinstance(__base__, tuple):
+        __base__ = (__base__,)
+
+    __cls_kwargs__ = __cls_kwargs__ or {}
+
+    fields: dict[str, Any] = {}
+    annotations: dict[str, Any] = {}
+
+    for f_name, f_def in field_definitions.items():
+        if isinstance(f_def, tuple):
+            if len(f_def) != 2:
+                raise PydanticUserError(
+                    f'Field definition for {f_name!r} should a single element representing the type or a two-tuple, the first element '
+                    'being the type and the second element the assigned value (either a default or the `Field()` function).',
+                    code='create-model-field-definitions',
+                )
+
+            annotations[f_name] = f_def[0]
+            fields[f_name] = f_def[1]
+        else:
+            annotations[f_name] = f_def
+
+    if __module__ is None:
+        f = sys._getframe(1)
+        __module__ = f.f_globals['__name__']
+
+    namespace: dict[str, Any] = {'__annotations__': annotations, '__module__': __module__}
+    if __doc__:
+        namespace.update({'__doc__': __doc__})
+    if __validators__:
+        namespace.update(__validators__)
+    namespace.update(fields)
+    if __config__:
+        namespace['model_config'] = __config__
+    resolved_bases = types.resolve_bases(__base__)
+    meta, ns, kwds = types.prepare_class(model_name, resolved_bases, kwds=__cls_kwargs__)
+    if resolved_bases is not __base__:
+        ns['__orig_bases__'] = __base__
+    namespace.update(ns)
+
+    return meta(
+        model_name,
+        resolved_bases,
+        namespace,
+        __pydantic_reset_parent_namespace__=False,
+        _create_model_module=__module__,
+        **kwds,
+    )
+
+
+__getattr__ = getattr_migration(__name__)
